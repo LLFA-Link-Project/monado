@@ -21,6 +21,9 @@
 #include <assert.h>
 
 static const char *driver_list[] = {
+#ifdef XRT_BUILD_DRIVER_ARPARA
+    "arpara",
+#endif
 #ifdef XRT_BUILD_DRIVER_CONTACTGLOVE
     "contactglove",
 #endif

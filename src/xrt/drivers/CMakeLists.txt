@@ -9,6 +9,14 @@ set(ENABLED_DRIVERS)
 add_library(drv_includes INTERFACE)
 target_include_directories(drv_includes INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
+
+if(XRT_BUILD_DRIVER_ARPARA)
+	add_subdirectory(arpara/rust)
+	add_library(drv_arpara STATIC arpara/arpara_hmd.cpp arpara/arpara_interface.h arpara/arpara_protocol.h)
+	target_link_libraries(drv_arpara PRIVATE xrt-interfaces aux_util aux_os aux_math arpara_rust)
+	list(APPEND ENABLED_HEADSET_DRIVERS arpara)
+endif()
+
 if(XRT_BUILD_DRIVER_ARDUINO)
 	add_library(
 		drv_arduino STATIC arduino/arduino_device.c arduino/arduino_interface.h

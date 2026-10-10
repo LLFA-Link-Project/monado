@@ -12,6 +12,10 @@
 #include "target_builder_interface.h"
 
 
+#ifdef XRT_BUILD_DRIVER_ARPARA
+#include "arpara/arpara_interface.h"
+#endif
+
 #ifdef XRT_BUILD_DRIVER_ARDUINO
 #include "arduino/arduino_interface.h"
 #endif
@@ -190,6 +194,9 @@ xrt_builder_create_func_t target_builder_list[] = {
  * assign sequential elements of out_xdevs to the created devices.
  */
 struct xrt_prober_entry target_entry_list[] = {
+#ifdef XRT_BUILD_DRIVER_ARPARA
+    {0x2c30, 0x1050, arpara_found, "arpara 5K", "arpara"},
+#endif
 #ifdef XRT_BUILD_DRIVER_CONTACTGLOVE
     {CONTACTGLOVE2_VID, CONTACTGLOVE2_PID, contactglove2_found, "ContactGlove2", "contactglove"},
 #endif // XRT_BUILD_DRIVER_BLUBUR_S1

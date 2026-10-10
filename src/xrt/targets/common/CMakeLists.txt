@@ -297,3 +297,7 @@ if(ANDROID)
 
 	target_link_libraries(target_instance_no_comp PRIVATE aux_android)
 endif()
+
+if(XRT_BUILD_DRIVER_ARPARA)
+	target_link_libraries(target_lists PRIVATE drv_arpara)
+endif()
