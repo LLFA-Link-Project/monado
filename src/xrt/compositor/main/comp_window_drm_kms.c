@@ -17,7 +17,7 @@ struct drm_kms_target
 	struct u_pacing_compositor *upc;
 	int64_t index, wake_ns, budget_ns;
 	unsigned next;
-	bool has_init_vulkan, failed;
+	bool has_init_vulkan, failed, sync_fd;
 };
 static bool
 target_init_pre_vulkan(struct comp_target *ct)
@@ -54,7 +54,7 @@ target_init_pre_vulkan(struct comp_target *ct)
 	u_pc_destroy(&t->upc);
 	u_pc_fake_create(s->nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
 	COMP_WARN(ct->c,
-	          "DRM/KMS DMA-BUF direct scanout: no CPU pixel copy; GPU release fence wait + queued page-flip, 3 "
+	          "DRM/KMS DMA-BUF direct scanout: no CPU pixel copy; queued page-flip, 3 "
 	          "images; no low-latency "
 	          "claim.");
 	return true;
@@ -71,6 +71,18 @@ target_init_post_vulkan(struct comp_target *ct, uint32_t width, uint32_t height)
 		return false;
 	}
 	COMP_INFO(ct->c, "DRM Vulkan GPU: %s", p.deviceName);
+	const char *sync = getenv("XRT_COMPOSITOR_DRM_SYNC_FD");
+	if (sync && strcmp(sync, "0") && strcmp(sync, "1")) {
+		COMP_ERROR(ct->c, "DRM_SYNC_FD must be 0 or 1 (unset selects automatically)");
+		return false;
+	}
+	t->sync_fd = (!sync || strcmp(sync, "0")) && vk->has_KHR_external_fence_fd &&
+	             comp_drm_dma_sync_fd_supported(vk->physical_device, vk->device);
+	if (sync && !strcmp(sync, "1") && !t->sync_fd) {
+		COMP_ERROR(ct->c, "Requested sync FD unavailable: plane IN_FENCE_FD=%d, external_fence_fd enabled=%d",
+		           comp_drm_kms_has_in_fence(t->kms), vk->has_KHR_external_fence_fd);
+		return false;
+	}
 	t->has_init_vulkan = true;
 	return true;
 }
@@ -120,9 +132,29 @@ target_create_images(struct comp_target *ct,
 			t->failed = true;
 			return;
 		}
+		if (t->sync_fd && !comp_drm_kms_supports_sync_fd(t->kms, i)) {
+			const char *sync = getenv("XRT_COMPOSITOR_DRM_SYNC_FD");
+			if (i || (sync && !strcmp(sync, "1"))) {
+				COMP_ERROR(ct->c, "Requested KMS sync FD handoff unavailable for image %u", i);
+				t->failed = true;
+				return;
+			}
+			t->sync_fd = false;
+		}
+		if (t->sync_fd && !comp_drm_dma_enable_sync_fd(t->dma[i])) {
+			COMP_ERROR(ct->c, "Exportable sync FD fence allocation failed");
+			t->failed = true;
+			return;
+		}
 		t->images[i].handle = comp_drm_dma_image(t->dma[i]);
 		t->images[i].view = comp_drm_dma_view(t->dma[i]);
 	}
+	COMP_INFO(ct->c, "DRM synchronization: %s",
+	          t->sync_fd
+	              ? (comp_drm_kms_has_in_fence(t->kms)
+	                     ? "Vulkan sync FD -> KMS IN_FENCE_FD; CPU release fence waits=0"
+			     : "Vulkan sync FD -> DMA-BUF reservation -> Rockchip KMS; CPU release fence waits=0")
+		      : "CPU release fence wait (disabled or unsupported); DMA-BUF scanout retained");
 	VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 	if (vk->vkCreateSemaphore(vk->device, &sem, NULL, &ct->semaphores.render_complete) != VK_SUCCESS) {
 		t->failed = true;
@@ -168,6 +200,7 @@ target_acquire(struct comp_target *ct, uint32_t *index)
 	struct vk_bundle_queue *queue = ct->c->base.vk.main_queue;
 	/* This slot is neither scanning out nor queued. Acquire FOREIGN ownership
 	 * before the renderer touches it, with the same externally locked queue. */
+	comp_drm_dma_retire(t->dma[t->next]);
 	vk_queue_lock(queue);
 	VkResult ret = comp_drm_dma_acquire(t->dma[t->next], queue->queue);
 	vk_queue_unlock(queue);
@@ -198,25 +231,31 @@ target_present(struct comp_target *ct,
 	}
 	int64_t begin = os_monotonic_get_ns();
 	vk_queue_lock(queue);
-	VkResult ret = comp_drm_dma_release(t->dma[index], queue->queue, ct->semaphores.render_complete, false);
+	int fd = -1;
+	VkResult ret =
+	    t->sync_fd ? comp_drm_dma_release_sync_fd(t->dma[index], queue->queue, ct->semaphores.render_complete, &fd)
+	               : comp_drm_dma_release(t->dma[index], queue->queue, ct->semaphores.render_complete, false);
 	vk_queue_unlock(queue);
 	int64_t ready = os_monotonic_get_ns();
-	if (ret != VK_SUCCESS || !comp_drm_kms_queue_imported(t->kms, index)) {
+	if (ret != VK_SUCCESS || !comp_drm_kms_queue_imported_fenced(t->kms, index, fd)) {
 		t->failed = true;
 		COMP_ERROR(ct->c, "DRM present failed VkResult=%d; no buffer reuse", ret);
 		return ret == VK_SUCCESS ? VK_ERROR_SURFACE_LOST_KHR : ret;
 	}
 	int64_t sample = ready - t->wake_ns;
 	int64_t period = comp_drm_kms_period_ns(t->kms);
-	if (t->wake_ns && sample > 0 && sample < period * 4)
+	if (!t->sync_fd && t->wake_ns && sample > 0 && sample < period * 4)
 		t->budget_ns = t->budget_ns ? (t->budget_ns * 7 + sample + 1000000) / 8 : sample + 1000000;
 	t->gpu_wait_ns += ready - begin;
 	t->flip_wait_ns += os_monotonic_get_ns() - ready;
 	if (++t->frames % 120 == 0) {
 		COMP_INFO(ct->c,
-		          "DMA-BUF 120 frames: average release/GPU wait %.3f ms, previous flip drain/commit %.3f ms; "
-		          "CPU pixel copies=0, wake-to-ready budget=%.3f ms",
-		          t->gpu_wait_ns / 120e6, t->flip_wait_ns / 120e6, t->budget_ns / 1e6);
+		          "DMA-BUF 120 frames: average %s %.3f ms, previous flip drain/commit %.3f ms; "
+		          "CPU pixel copies=0; CPU release fence waits=%u; prediction budget=%.3f ms%s",
+		          t->sync_fd ? "release submit/export" : "release/GPU wait", t->gpu_wait_ns / 120e6,
+		          t->flip_wait_ns / 120e6, t->sync_fd ? 0 : 120,
+		          (t->budget_ns ? t->budget_ns : (int64_t)comp_drm_kms_period_ns(t->kms)) / 1e6,
+		          t->sync_fd ? " (fixed one-period estimate, not GPU time)" : " (wake-to-ready)");
 		t->gpu_wait_ns = t->flip_wait_ns = 0;
 	}
 	t->index = -1;

@@ -11,9 +11,9 @@ Monado の DRM ターゲットは DMA-BUF 直接 scanout を使用します。CP
 ```
 Monado renderer -> exportable BGRA8 LINEAR VkImage (GENERAL)
  -> render_complete binary semaphore を消費
- -> GPU queue から FOREIGN queue へ ownership release + GPU fence wait
+ -> GPU queue から FOREIGN queue へ ownership release + sync FD export
  -> DMA-BUF FD -> KMS GEM import -> XRGB8888 FB
- -> atomic commit -> page-flip 完了 -> 前の scanout image を再利用
+ -> IN_FENCE_FD または DMA-BUF write fence -> atomic commit -> page-flip 完了 -> 前の scanout image を再利用
 ```
 
 サービスは描画画像 3 枚をそのまま KMS に登録し、staging buffer、CPU pixel mapping、全画面コピーを省きます。
@@ -31,22 +31,44 @@ FOREIGN は Vulkan GPU と異なる表示デバイス/ドライバに ownership 
 対応がない場合に別の queue-family 定数で代用しません。
 
 acquire ownership barrier は renderer と同じ queue に非同期 submit し、CPU fence wait を行いません。
-acquire と release の command buffer は別にし、release fence 完了前に acquire command を再記録しません。
-GPU 完了を release fence の CPU wait で確認してから KMS に渡し、page-flip 完了後だけ再利用します。
+acquire と release の command buffer は別です。release は renderer の binary semaphore を1回消費し、
+FOREIGN ownership barrier の完了 fence を `VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT` で export します。
+選択 plane の `IN_FENCE_FD` があれば、nonblocking atomic commit に sync FD を添付します。
+提示された Rockchip ログにはこの property がないため、Rockchip では DMA-BUF reservation の
+`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`（WRITE）経路も実装しました。
+Linux 6.18 の [atomic helper](https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/drm_atomic_helper.c) は
+GEM plane の prepare_fb が未指定の場合に reservation fence を抽出します。
+[Rockchip VOP2](https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/rockchip/rockchip_drm_vop2.c) はこの経路を使います。
+他の KMS driver に同じ動作を仮定せず、暗黙同期経路は driver 名 `rockchip` に限定します。
+初期化時には EXPORT_SYNC_FILE ioctl を照会し、フレームごとの IMPORT_SYNC_FILE が失敗した場合は
+未同期の画面を commit せず停止します。ioctl 成功だけで実機 scanout 成功とは判定しません。
+
+sync FD 経路には `VK_KHR_external_fence_fd` の有効化と SYNC_FD の exportability が必要です。
+`XRT_COMPOSITOR_DRM_SYNC_FD` が未指定なら対応判定して選択し、未対応なら既存の
+DMA-BUF＋CPU release fence 待ちを維持します。`1` は新経路を必須にし、未対応なら起動を失敗させます。
+`0` は比較用に従来の待ちを明示選択します。いずれも CPU pixel copy は行いません。
+[SYNC_FD export](https://docs.vulkan.org/refpages/latest/refpages/source/vkGetFenceFdKHR.html) は fence payload を転送するため、
+元の Vulkan fence で完了を判定し直しません。返却 FD が `-1` なら既に完了しており、待ちを追加しません。
+FD は atomic ioctl / reservation import の後に success/failure とも close します。
+
 KMS commit は1件だけ pending にし、scanout / queued / free の3状態を区別します。
-次の acquire は free image だけを選びます。present 後の renderer の強制 acquire/wait は DRM で省き、
-前の page-flip 完了を次の present が確認するまで、次フレームの GPU 処理を進めます。
+export 済み画像は、その fenced commit の完了に加え、後続 page-flip で表示から外れたことを確認してから
+command buffer/fence を再利用します。失敗時には再利用せず、終了処理で GPU idle を待ちます。
+present 後の renderer の強制 acquire/wait は DRM で省き、次フレームと表示待ちを重ねます。
+**renderer の共有 descriptor pool / mapped UBO / command buffer を保護する GPU fence 待ちは残ります。**
+非同期 present ではその待ちを描画準備より前に置き、GPU 使用中の共有リソースを書き換えません。
+GPU 待ちの全面除去・複数フレームの同時合成には、これらもフレームごとに分離する必要があります。
 独立プローブの従来の present API は同期動作を維持します。
 待機は約 3 秒を上限とし、失敗後は再利用を禁止します。queue は mutex で外部同期します。
-今回 GPU 処理と page-flip 待ちを重ねる FIFO pipeline を追加しました。
-KMS IN_FENCE_FD/OUT_FENCE_PTR による release fence の CPU wait 除去は後続課題です。
-予測表示時刻には直近の page-flip 位相と wake→GPU-ready の平滑化した実測予算（1 ms margin）を使います。
+予測表示時刻には直近の page-flip 位相を使います。CPU fence 待ち経路では wake→GPU-ready の
+平滑化した実測予算（1 ms margin）、sync FD 経路では保守的に1表示周期を予算とします。
+後者の submit/export 時間は GPU 完了時間ではないので、描画予算に代入しません。
 GPU-bound の queue に fake pacer の固定3 ms予算による待機を加えず、wake は即時にし、FIFO backpressure で制御します。
 DRM_CAP_TIMESTAMP_MONOTONIC がある場合は KMS event timestamp を使い、ない場合はイベント受信時の
 CPU monotonic 時刻を使ってログに明示します。後者は通知遅延を含みます。
 光学的な present-to-photon offset は未校正です。60/90 Hz の安定駆動はまだ保証しません。
-120 フレームごとに release/queue 完了待ち、前の flip drain/commit の平均 CPU 経過時間と
-wake-to-ready の予算をログに出します。後者の flip 時間は現在の commit の完了待ちではありません。
+120 フレームごとに release submit/export（従来経路では release/GPU wait）、前の flip drain/commit の
+平均 CPU 経過時間と prediction budget、CPU release fence wait の回数をログに出します。後者の flip 時間は現在の commit の完了待ちではありません。
 これにはアプリ側の描画や acquire 待ちを含まず、全体 FPS / motion-to-photon latency ではありません。
 
 ## Orange Pi 5 でのビルド
@@ -284,8 +306,54 @@ idle中に完了済みイベントを後から回収しても、通知を処理�
 ローカルでは全体ビルド、arpara/Rust、DMA-BUF ownership/timeout、非同期 acquire の待機数と別 command buffer、
 3画像の scanout/queued 保護、vblank位相と描画予算の予測テストが成功しています。
 AArch64 は変更モジュールの object compile まで確認しました。
-新 pipeline の実機 FPS・表示・終了時復元は **未検証** です。画面比率は今回変更していません。
+下記の追加ログで pipeline の実機更新率を確認しました。画面比率は今回変更していません。
 
 比較時は同じ hello_xr 設定で、上記コマンドの mode をまず `3840x1920@71.998`、保存先を
 `/tmp/monado-drm-pipeline-72hz.log` にして採取し、次に90 Hzで
 `/tmp/monado-drm-pipeline-90hz.log` を採取してください。`KMS scanout` の update_fps/p95/更新なし周期で比較します。
+
+
+## release fence の CPU 待ち改善と再測定
+
+ユーザー提供 `ArparaOpiLog/1` のログ（`1c737dbf2`）は以下でした。
+更新率は窓の FPS の調和平均、起動窓を含む丸め値からの概算です。
+
+| モード | 対象区間 | 更新率 | 複数vblank間隔 | 更新なしvblank |
+|---|---:|---:|---:|---:|
+| 71.998 Hz | 1680 | 71.96 FPS | 1 / 1680 | 1 |
+| 90.001 Hz | 3120 | 86.56 FPS | 124 / 3120 | 124 |
+
+今回の sync FD 経路の実機表示・更新率・終了時復元は未検証です。
+ローカルには DRM card / PanVK / HMD がないため、コンパイルと fault injection で検証しています。
+`syncfd-build.log`、`syncfd-tests.log`、`syncfd-arm.log` は `build/kms-validation/` に保存します。
+全体ビルドと CTest **32/32** が成功しました。テストには sync FD export の CPU 待ちゼロ、
+表示退役前の再利用禁止、already-signaled FD=-1、export/atomic/property/import 失敗時の安全停止と
+FD 解放、Rockchip write fence の登録を含みます。`monado-cli test` も終了コード0でしたが、
+ローカルに HMD がないため実機 arpara の認識/IMU 回帰を確認したものではありません。
+AArch64 は変更 C モジュールの object compile であり、Orange Pi 上の全体リンク/実行ではありません。
+
+既存のテスト手順に `XRT_COMPOSITOR_DRM_SYNC_FD=1` を追加します。
+
+```bash
+cmake --build build --parallel 2
+XRT_COMPOSITOR_FORCE_DRM=1 \
+XRT_COMPOSITOR_DRM_DEVICE=/dev/dri/card0 \
+XRT_COMPOSITOR_DRM_CONNECTOR=DP-1 \
+XRT_COMPOSITOR_DRM_MODE=3840x1920@90.001 \
+XRT_COMPOSITOR_DRM_ALLOW_STRETCH=1 \
+XRT_COMPOSITOR_DRM_SYNC_FD=1 \
+XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
+XRT_COMPOSITOR_LOG=info \
+./build/src/xrt/targets/service/monado-service \
+  2>&1 | tee -i /tmp/monado-drm-syncfd-90hz.log
+```
+
+別ターミナルで従来の hello_xr を同じ設定で動かし、約60秒採取します。
+`DRM synchronization: Vulkan sync FD -> ...; CPU release fence waits=0` と
+120フレームごとの `release submit/export` を確認してください。これは CPU 側の submit/export 時間です。
+`KMS scanout` の update_fps / p95 / vblanks_without_update で表示更新を比較します。
+比較対象は `XRT_COMPOSITOR_DRM_SYNC_FD=0`、保存先 `/tmp/monado-drm-cpufence-90hz.log` とします。
+72 Hz も同じ手順で mode を `3840x1920@71.998` に変えます。
+最後は hello_xr とサービスを終了し、`Previous atomic KMS state restored` を確認してください。
+新経路に失敗した場合はエラー行を含むログを保存し、`0` で既存経路へ戻せます。
+画面比率・光学校正・IMU はこの変更の対象にしていません。

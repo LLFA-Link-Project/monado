@@ -35,3 +35,18 @@ VkResult
 comp_drm_dma_release(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool clear);
 void
 comp_drm_dma_destroy(struct comp_drm_dma *d);
+
+/* Caller must have enabled VK_KHR_external_fence_fd on this device. */
+bool
+comp_drm_dma_sync_fd_supported(VkPhysicalDevice physical, VkDevice device);
+/* Before first acquire; exportable fence creation failure is fatal to this image. */
+bool
+comp_drm_dma_enable_sync_fd(struct comp_drm_dma *d);
+/* Consumes renderer semaphore once, returns caller-owned sync FD (or -1 for
+ * already signaled). No CPU GPU wait. On failure, do not retry or reuse image. */
+VkResult
+comp_drm_dma_release_sync_fd(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, int *fd);
+/* Only after KMS has completed the fenced commit AND a subsequent page-flip
+ * has removed this image from scanout. Never call after a failed commit. */
+void
+comp_drm_dma_retire(struct comp_drm_dma *d);

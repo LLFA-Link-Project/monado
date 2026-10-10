@@ -1143,6 +1143,12 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Consistency check.
 	assert(!fast_path || c->base.layer_accum.layer_count >= 1);
 
+	/* Queued non-WSI presentation may return before rendering finishes.
+	 * Shared render resources (descriptor pools, mapped UBOs, command buffer)
+	 * must be retired before preparing the next frame, not merely at submit. */
+	if (ct->defer_present_wait)
+		renderer_wait_for_last_fence(r);
+
 	// For scratch image debugging.
 	struct chl_frame_state frame_state;
 	chl_frame_state_init( //

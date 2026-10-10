@@ -16,7 +16,9 @@ static VkResult wait_result;
 static unsigned resets, destroyed, idle, fence_waits;
 static VkCommandBuffer reset_cmd;
 static int exported_fd;
-static bool exportable;
+static bool exportable, fence_exportable, already_signaled;
+static VkResult export_result;
+static unsigned sync_exports, export_fence_creates;
 template <typename T>
 static T
 handle()
@@ -44,6 +46,14 @@ vkGetPhysicalDeviceFormatProperties2(VkPhysicalDevice, VkFormat, VkFormatPropert
 	list->drmFormatModifierCount = 1;
 	if (list->pDrmFormatModifierProperties)
 		list->pDrmFormatModifierProperties[0] = {0, 1, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT};
+}
+VKAPI_ATTR void VKAPI_CALL
+vkGetPhysicalDeviceExternalFenceProperties(VkPhysicalDevice,
+                                           const VkPhysicalDeviceExternalFenceInfo *info,
+                                           VkExternalFenceProperties *out)
+{
+	REQUIRE(info->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT);
+	out->externalFenceFeatures = fence_exportable ? VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT : 0;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
 vkCreateImage(VkDevice, const VkImageCreateInfo *, const VkAllocationCallbacks *, VkImage *out)
@@ -101,8 +111,14 @@ vkAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo *, VkComman
 	return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
-vkCreateFence(VkDevice, const VkFenceCreateInfo *, const VkAllocationCallbacks *, VkFence *out)
+vkCreateFence(VkDevice, const VkFenceCreateInfo *info, const VkAllocationCallbacks *, VkFence *out)
 {
+	if (info->pNext) {
+		auto *export_info = (const VkExportFenceCreateInfo *)info->pNext;
+		REQUIRE(export_info->sType == VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO);
+		REQUIRE(export_info->handleTypes == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT);
+		export_fence_creates++;
+	}
 	*out = handle<VkFence>();
 	return VK_SUCCESS;
 }
@@ -199,15 +215,37 @@ get_fd(VkDevice, const VkMemoryGetFdInfoKHR *, int *out)
 	*out = exported_fd = fds[0];
 	return VK_SUCCESS;
 }
+static VKAPI_ATTR VkResult VKAPI_CALL
+get_fence_fd(VkDevice, const VkFenceGetFdInfoKHR *info, int *out)
+{
+	REQUIRE(info->handleType == VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT);
+	sync_exports++;
+	if (export_result != VK_SUCCESS)
+		return export_result;
+	if (already_signaled) {
+		*out = -1;
+		return VK_SUCCESS;
+	}
+	int fds[2];
+	REQUIRE(pipe(fds) == 0);
+	close(fds[1]);
+	*out = fds[0];
+	return VK_SUCCESS;
+}
 extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vkGetDeviceProcAddr(VkDevice, const char *name)
 {
+	if (!strcmp(name, "vkGetFenceFdKHR"))
+		return (PFN_vkVoidFunction)get_fence_fd;
 	return !strcmp(name, "vkGetMemoryFdKHR") ? (PFN_vkVoidFunction)get_fd : (PFN_vkVoidFunction)get_modifier;
 }
 static comp_drm_dma *
 create()
 {
-	wait_result = VK_SUCCESS;
+	wait_result = export_result = VK_SUCCESS;
+	fence_exportable = true;
+	already_signaled = false;
+	sync_exports = export_fence_creates = 0;
 	exportable = true;
 	resets = destroyed = idle = fence_waits = 0;
 	return comp_drm_dma_create(handle<VkPhysicalDevice>(), handle<VkDevice>(), 3, 64, 64, VK_FORMAT_B8G8R8A8_UNORM,
@@ -258,4 +296,72 @@ TEST_CASE("DMA-BUF unsupported export refuses allocation", "[drm][dma]")
 	REQUIRE(comp_drm_dma_create(handle<VkPhysicalDevice>(), handle<VkDevice>(), 3, 64, 64, VK_FORMAT_B8G8R8A8_UNORM,
 	                            VK_IMAGE_USAGE_STORAGE_BIT) == nullptr);
 	REQUIRE(destroyed == 0);
+}
+
+TEST_CASE("DMA-BUF async sync FD release waits only in KMS, reuse requires retirement", "[drm][dma]")
+{
+	auto *d = create();
+	REQUIRE(comp_drm_dma_sync_fd_supported(handle<VkPhysicalDevice>(), handle<VkDevice>()));
+	REQUIRE(comp_drm_dma_enable_sync_fd(d));
+	REQUIRE(export_fence_creates == 1);
+	for (int cycle = 0; cycle < 4; cycle++) {
+		REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_SUCCESS);
+		int fd = -2;
+		REQUIRE(comp_drm_dma_release_sync_fd(d, handle<VkQueue>(), handle<VkSemaphore>(), &fd) == VK_SUCCESS);
+		REQUIRE(fd >= 0);
+		REQUIRE(fcntl(fd, F_GETFD) >= 0);
+		REQUIRE(waited == handle<VkSemaphore>());
+		REQUIRE(fence_waits == 0);
+		REQUIRE(last_barrier.dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT);
+		auto before = resets;
+		REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
+		REQUIRE(resets == before);
+		close(fd); // KMS ioctl owns a reference, closing FD alone is NOT retirement.
+		REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
+		comp_drm_dma_retire(d); // Simulates fenced commit + subsequent replacement flip.
+	}
+	REQUIRE(sync_exports == 4);
+	comp_drm_dma_destroy(d);
+	REQUIRE(idle == 0);
+	REQUIRE(fcntl(exported_fd, F_GETFD) == -1);
+}
+TEST_CASE("DMA-BUF already signaled sync FD and export failure stay safe", "[drm][dma]")
+{
+	auto *d = create();
+	REQUIRE(comp_drm_dma_enable_sync_fd(d));
+	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_SUCCESS);
+	int fd = -2;
+	SECTION("Already signaled FD -1 is successful but scanout must still retire")
+	{
+		already_signaled = true;
+		REQUIRE(comp_drm_dma_release_sync_fd(d, handle<VkQueue>(), VK_NULL_HANDLE, &fd) == VK_SUCCESS);
+		REQUIRE(fd == -1);
+		REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
+	}
+	SECTION("Failed export cannot retry submit or unlock reuse through retirement")
+	{
+		export_result = VK_ERROR_TOO_MANY_OBJECTS;
+		REQUIRE(comp_drm_dma_release_sync_fd(d, handle<VkQueue>(), VK_NULL_HANDLE, &fd) == export_result);
+		REQUIRE(fd == -1);
+		comp_drm_dma_retire(d);
+		REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
+		REQUIRE(comp_drm_dma_release_sync_fd(d, handle<VkQueue>(), VK_NULL_HANDLE, &fd) != VK_SUCCESS);
+		REQUIRE(sync_exports == 1);
+	}
+	REQUIRE(fence_waits == 0);
+	comp_drm_dma_destroy(d);
+	REQUIRE(idle == 1); // Even exported payloads require GPU retirement on failure/shutdown.
+}
+TEST_CASE("DMA-BUF optional sync FD support detection and synchronous fallback", "[drm][dma]")
+{
+	auto *d = create();
+	fence_exportable = false;
+	REQUIRE_FALSE(comp_drm_dma_sync_fd_supported(handle<VkPhysicalDevice>(), handle<VkDevice>()));
+	int fd;
+	REQUIRE(comp_drm_dma_release_sync_fd(d, handle<VkQueue>(), VK_NULL_HANDLE, &fd) ==
+	        VK_ERROR_EXTENSION_NOT_PRESENT);
+	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_SUCCESS);
+	REQUIRE(comp_drm_dma_release(d, handle<VkQueue>(), VK_NULL_HANDLE, false) == VK_SUCCESS);
+	REQUIRE(fence_waits == 1);
+	comp_drm_dma_destroy(d);
 }

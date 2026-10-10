@@ -14,9 +14,10 @@ struct comp_drm_dma
 	VkCommandPool pool;
 	VkCommandBuffer cmd[2];
 	VkFence fence;
+	PFN_vkGetFenceFdKHR get_fence_fd;
 	uint32_t family, pitch, offset;
 	int fd;
-	bool initialized, external, pending, acquire_pending;
+	bool initialized, external, pending, acquire_pending, exported;
 };
 #define CHECK(call)                                                                                                    \
 	do {                                                                                                           \
@@ -177,8 +178,49 @@ fail:
 	comp_drm_dma_destroy(d);
 	return NULL;
 }
+bool
+comp_drm_dma_sync_fd_supported(VkPhysicalDevice physical, VkDevice device)
+{
+	VkPhysicalDeviceExternalFenceInfo info = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+	                                          .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+	VkExternalFenceProperties props = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_FENCE_PROPERTIES};
+	vkGetPhysicalDeviceExternalFenceProperties(physical, &info, &props);
+	return (props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT) &&
+	       vkGetDeviceProcAddr(device, "vkGetFenceFdKHR");
+}
+bool
+comp_drm_dma_enable_sync_fd(struct comp_drm_dma *d)
+{
+	if (d->initialized || d->pending || d->get_fence_fd)
+		return false;
+	PFN_vkGetFenceFdKHR get_fd = (PFN_vkGetFenceFdKHR)vkGetDeviceProcAddr(d->device, "vkGetFenceFdKHR");
+	if (!get_fd)
+		return false;
+	VkExportFenceCreateInfo export = {.sType = VK_STRUCTURE_TYPE_EXPORT_FENCE_CREATE_INFO,
+	                                  .handleTypes = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+	VkFenceCreateInfo info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = &export};
+	VkFence fence;
+	VkResult ret = vkCreateFence(d->device, &info, NULL, &fence);
+	if (ret != VK_SUCCESS) {
+		fprintf(stderr, "DRM exportable fence creation: VkResult=%d\n", ret);
+		return false;
+	}
+	vkDestroyFence(d->device, d->fence, NULL);
+	d->fence = fence;
+	d->get_fence_fd = get_fd;
+	return true;
+}
+void
+comp_drm_dma_retire(struct comp_drm_dma *d)
+{
+	/* Caller proved a successful fenced page-flip replaced this scanout image.
+	 * Export has copy transference: the original fence no longer tracks this work. */
+	if (d->exported) {
+		d->pending = d->acquire_pending = d->exported = false;
+	}
+}
 static VkResult
-ownership(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool release, bool clear)
+ownership(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool release, bool clear, int *sync_fd)
 {
 	if (d->pending || (release ? (!d->initialized || d->external) : (d->initialized && !d->external)))
 		return VK_ERROR_INITIALIZATION_FAILED;
@@ -229,6 +271,18 @@ ownership(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool release,
 		return VK_SUCCESS;
 	}
 	d->pending = true;
+	if (sync_fd) {
+		VkFenceGetFdInfoKHR info = {.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR,
+		                            .fence = d->fence,
+		                            .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT};
+		VkResult ret = d->get_fence_fd(d->device, &info, sync_fd);
+		if (ret != VK_SUCCESS) {
+			fprintf(stderr, "DRM vkGetFenceFdKHR SYNC_FD: VkResult=%d\n", ret);
+			return ret; /* Submitted work remains pending: no retry or reuse. */
+		}
+		d->external = d->exported = true;
+		return VK_SUCCESS; /* -1 is valid: already signaled, KMS needs no wait. */
+	}
 	VkResult ret = vkWaitForFences(d->device, 1, &d->fence, VK_TRUE, UINT64_C(3000000000));
 	if (ret != VK_SUCCESS)
 		return ret; /* Never reset/reuse in-flight commands. */
@@ -243,12 +297,20 @@ fail:
 VkResult
 comp_drm_dma_acquire(struct comp_drm_dma *d, VkQueue q)
 {
-	return ownership(d, q, VK_NULL_HANDLE, false, false);
+	return ownership(d, q, VK_NULL_HANDLE, false, false, NULL);
 }
 VkResult
 comp_drm_dma_release(struct comp_drm_dma *d, VkQueue q, VkSemaphore wait, bool clear)
 {
-	return ownership(d, q, wait, true, clear);
+	return ownership(d, q, wait, true, clear, NULL);
+}
+VkResult
+comp_drm_dma_release_sync_fd(struct comp_drm_dma *d, VkQueue q, VkSemaphore wait, int *fd)
+{
+	*fd = -1;
+	if (!d->get_fence_fd)
+		return VK_ERROR_EXTENSION_NOT_PRESENT;
+	return ownership(d, q, wait, true, false, fd);
 }
 VkImage
 comp_drm_dma_image(struct comp_drm_dma *d)

@@ -44,3 +44,15 @@ bool
 comp_drm_kms_queue_imported(struct comp_drm_kms *k, unsigned index);
 uint64_t
 comp_drm_kms_last_flip_ns(struct comp_drm_kms *k);
+
+bool
+comp_drm_kms_has_in_fence(struct comp_drm_kms *k);
+/* Consumes sync_fd on ALL paths. -1 means GPU work is already complete.
+ * Atomic commit keeps its own kernel reference until the input fence signals. */
+bool
+comp_drm_kms_queue_imported_fenced(struct comp_drm_kms *k, unsigned index, int sync_fd);
+
+/* After importing this image: IN_FENCE_FD or verified Rockchip reservation
+ * sync-file ioctl. Other drivers require IN_FENCE_FD. */
+bool
+comp_drm_kms_supports_sync_fd(struct comp_drm_kms *k, unsigned index);

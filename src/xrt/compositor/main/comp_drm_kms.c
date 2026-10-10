@@ -16,6 +16,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <time.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 
 struct saved_prop
 {
@@ -34,17 +36,19 @@ struct comp_drm_kms
 	FILE *log;
 	drmModeRes *res;
 	drmModeModeInfo mode;
-	uint32_t connector, crtc, plane, blob;
+	uint32_t connector, crtc, plane, blob, in_fence;
 	struct saved_prop props[16];
 	unsigned count;
 	struct dumb buffers[2];
 	struct
 	{
 		uint32_t handle, fb;
+		int dma_fd; /* Borrowed from Vulkan image, outlives the KMS object. */
+		bool implicit_sync;
 	} imported[COMP_DRM_IMAGES];
 	struct comp_drm_slots slots;
 	uint64_t last_flip_ns, pending_since_ns;
-	bool timestamp_monotonic;
+	bool timestamp_monotonic, rockchip;
 	unsigned next;
 	bool changed, failed, flip_done;
 	struct comp_drm_timing timing;
@@ -120,6 +124,7 @@ comp_drm_kms_open(const char *device, FILE *log)
 		k->res = r;
 		drmVersionPtr v = drmGetVersion(fd);
 		fprintf(log, "KMS device=%s driver=%s master=%d\n", path, v ? v->name : "unknown", drmIsMaster(fd));
+		k->rockchip = v && !strcmp(v->name, "rockchip");
 		drmFreeVersion(v);
 		uint64_t monotonic = 0;
 		k->timestamp_monotonic = !drmGetCap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, &monotonic) && monotonic;
@@ -451,6 +456,8 @@ comp_drm_kms_prepare(struct comp_drm_kms *k, const char *connector, const char *
 		fprintf(k->log, "No plane passed XRGB8888/LINEAR TEST_ONLY; no modeset performed\n");
 		return false;
 	}
+	k->in_fence = property(k, k->plane, DRM_MODE_OBJECT_PLANE, "IN_FENCE_FD", NULL);
+	fprintf(k->log, "KMS plane IN_FENCE_FD: %s\n", k->in_fence ? "supported" : "unavailable");
 	fprintf(k->log,
 	        "Selected connector=%u crtc=%u plane=%u mode=%ux%u@%.3f format=XRGB8888 modifier=LINEAR pitch=%u; "
 	        "CPU-copy diagnostic\n",
@@ -502,13 +509,18 @@ comp_drm_kms_present(struct comp_drm_kms *k, const uint8_t *bgra, uint32_t strid
 	return result;
 }
 static bool
-queue_fb(struct comp_drm_kms *k, uint32_t fb, int index)
+queue_fb(struct comp_drm_kms *k, uint32_t fb, int index, int sync_fd)
 {
 	if (!comp_drm_kms_pump(k, true))
 		return false;
 	drmModeAtomicReq *a = request(k, fb, false);
 	if (!a)
 		return false;
+	if (sync_fd >= 0 &&
+	    (!k->in_fence || drmModeAtomicAddProperty(a, k->plane, k->in_fence, (uint64_t)sync_fd) < 0)) {
+		drmModeAtomicFree(a);
+		return false;
+	}
 	k->flip_done = false;
 	int ret = drmModeAtomicCommit(
 	    k->fd, a, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, k);
@@ -562,7 +574,7 @@ comp_drm_kms_pump(struct comp_drm_kms *k, bool wait)
 static bool
 present_fb(struct comp_drm_kms *k, uint32_t fb)
 {
-	if (!queue_fb(k, fb, -1) || !comp_drm_kms_pump(k, true))
+	if (!queue_fb(k, fb, -1, -1) || !comp_drm_kms_pump(k, true))
 		return false;
 	k->next ^= 1;
 	return true;
@@ -575,6 +587,20 @@ comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pit
 		return false;
 	if (drmPrimeFDToHandle(k->fd, fd, &k->imported[index].handle))
 		return error(k, "PRIME FD import");
+	k->imported[index].dma_fd = fd;
+	/* Rockchip 6.18 uses atomic helpers and DRIVER_GEM; default prepare_fb
+	 * extracts the DMA-BUF reservation fence. Do not assume this for other KMS
+	 * drivers. EXPORT_SYNC_FILE checks ioctl support without installing a fence. */
+#ifdef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+	if (!k->in_fence && k->rockchip) {
+		struct dma_buf_export_sync_file probe = {.flags = DMA_BUF_SYNC_WRITE, .fd = -1};
+		k->imported[index].implicit_sync = !ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &probe);
+		if (probe.fd >= 0)
+			close(probe.fd);
+		fprintf(k->log, "DMA-BUF FB[%u] reservation sync-file ioctl: %s\n", index,
+		        k->imported[index].implicit_sync ? "supported (Rockchip implicit fencing)" : "unavailable");
+	}
+#endif
 	uint32_t handles[4] = {k->imported[index].handle}, pitches[4] = {pitch}, offsets[4] = {offset};
 	uint64_t modifiers[4] = {DRM_FORMAT_MOD_LINEAR};
 	int ret =
@@ -604,11 +630,49 @@ comp_drm_kms_slot_free(struct comp_drm_kms *k, unsigned index)
 	return !k->failed && comp_drm_slot_free(&k->slots, index);
 }
 bool
+comp_drm_kms_has_in_fence(struct comp_drm_kms *k)
+{
+	return k->in_fence != 0;
+}
+bool
+comp_drm_kms_supports_sync_fd(struct comp_drm_kms *k, unsigned index)
+{
+	return index < COMP_DRM_IMAGES && (k->in_fence || k->imported[index].implicit_sync);
+}
+static bool
+import_fence(struct comp_drm_kms *k, unsigned index, int fd)
+{
+	if (fd < 0 || k->in_fence)
+		return true;
+#ifdef DMA_BUF_IOCTL_IMPORT_SYNC_FILE
+	if (k->imported[index].implicit_sync) {
+		struct dma_buf_import_sync_file info = {.flags = DMA_BUF_SYNC_WRITE, .fd = fd};
+		if (!ioctl(k->imported[index].dma_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &info))
+			return true;
+		return error(k, "DMA_BUF_IOCTL_IMPORT_SYNC_FILE WRITE");
+	}
+#endif
+	fprintf(k->log, "No verified KMS fence handoff; refusing unsynchronized scanout\n");
+	return false;
+}
+bool
+comp_drm_kms_queue_imported_fenced(struct comp_drm_kms *k, unsigned index, int sync_fd)
+{
+	bool ok = index < COMP_DRM_IMAGES && comp_drm_kms_pump(k, true) && k->plane &&
+	          comp_drm_kms_slot_free(k, index) && k->imported[index].fb && import_fence(k, index, sync_fd) &&
+	          queue_fb(k, k->imported[index].fb, index, k->in_fence ? sync_fd : -1);
+	/* Atomic ioctl references the sync_file, never consumes the userspace FD.
+	 * Close on success and on every failure, including before the ioctl. */
+	if (sync_fd >= 0)
+		close(sync_fd);
+	if (!ok)
+		k->failed = true; /* Exported GPU work must never unlock unsafe reuse. */
+	return ok;
+}
+bool
 comp_drm_kms_queue_imported(struct comp_drm_kms *k, unsigned index)
 {
-	if (!comp_drm_kms_pump(k, true) || !k->plane || !comp_drm_kms_slot_free(k, index) || !k->imported[index].fb)
-		return false;
-	return queue_fb(k, k->imported[index].fb, index);
+	return comp_drm_kms_queue_imported_fenced(k, index, -1);
 }
 bool
 comp_drm_kms_present_imported(struct comp_drm_kms *k, unsigned index)
