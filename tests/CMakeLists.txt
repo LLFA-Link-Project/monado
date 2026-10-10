@@ -61,7 +61,7 @@ if(XRT_BUILD_DRIVER_ARPARA)
 endif()
 
 if(XRT_HAVE_DRM_KMS AND XRT_MODULE_COMPOSITOR_MAIN)
-	list(APPEND tests tests_drm_dma)
+	list(APPEND tests tests_drm_dma tests_drm_timing)
 endif()
 
 foreach(testname ${tests})
@@ -186,4 +186,5 @@ endif()
 
 if(TARGET tests_drm_dma)
 	target_link_libraries(tests_drm_dma PRIVATE comp_drm_dma)
+	target_link_libraries(tests_drm_timing PRIVATE comp_drm_kms)
 endif()

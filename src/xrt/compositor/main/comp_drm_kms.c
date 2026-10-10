@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 #define _POSIX_C_SOURCE 200809L
 #include "comp_drm_kms.h"
+#include "comp_drm_timing.h"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
@@ -43,6 +44,7 @@ struct comp_drm_kms
 	int scanout;
 	unsigned next;
 	bool changed, failed, flip_done;
+	struct comp_drm_timing timing;
 	uint32_t old_blob;
 };
 static bool
@@ -452,10 +454,24 @@ static void
 flip(int fd, unsigned sequence, unsigned sec, unsigned usec, void *data)
 {
 	(void)fd;
-	(void)sequence;
-	(void)sec;
-	(void)usec;
-	*(bool *)data = true;
+	struct comp_drm_kms *k = data;
+	k->flip_done = true;
+	uint64_t timestamp = (uint64_t)sec * UINT64_C(1000000000) + (uint64_t)usec * 1000;
+	struct comp_drm_timing *t = &k->timing;
+	if (!comp_drm_timing_add(t, timestamp, sequence))
+		return;
+	qsort(t->intervals, t->count, sizeof(t->intervals[0]), comp_drm_timing_compare);
+	/* Nearest-rank percentiles. Sequence gaps count vblanks without a new FB,
+	 * not dropped application frames or missed predicted-present deadlines. */
+	fprintf(k->log,
+	        "KMS scanout: mode=%.3f Hz update_fps=%.3f intervals=%u "
+	        "interval_ms[min/p50/p95/max]=%.3f/%.3f/%.3f/%.3f "
+	        "vblanks_without_update=%lld multi_vblank_intervals=%llu\n",
+	        refresh(&k->mode), t->count * 1e9 / t->sum_ns, t->count, t->intervals[0] / 1e6,
+	        t->intervals[(t->count + 1) / 2 - 1] / 1e6, t->intervals[(t->count * 95 + 99) / 100 - 1] / 1e6,
+	        t->intervals[t->count - 1] / 1e6, t->sequence_valid ? (long long)t->skipped : -1LL,
+	        (unsigned long long)t->late);
+	comp_drm_timing_reset_window(t);
 }
 static bool
 present_fb(struct comp_drm_kms *k, uint32_t fb);
@@ -480,8 +496,7 @@ present_fb(struct comp_drm_kms *k, uint32_t fb)
 		return false;
 	k->flip_done = false;
 	int ret = drmModeAtomicCommit(
-	    k->fd, a, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT,
-	    &k->flip_done);
+	    k->fd, a, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, k);
 	drmModeAtomicFree(a);
 	if (ret) {
 		k->failed = true;

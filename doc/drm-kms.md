@@ -200,3 +200,50 @@ HMD driver の仮値を実仕様として書き換えることなく、composito
 ログは `build/kms-validation/dma-*.log` に保存します（Git 管理対象外）。
 残る課題は、実機での DMA-BUF 表示確認、LINEAR 非対応時の modifier 交渉拡張、非同期 fence/pacing、
 画面比率と光学校正です。arpara Rust/HID/IMU コードは変更していません。
+
+## hello_xr の更新 FPS とフレーム間隔の測定
+
+サービスの `KMS scanout:` 行は、kernel page-flip event の timestamp と sequence に基づきます。
+CPU の present 呼び出し回数ではなく、完了した framebuffer 更新の間隔 120 個で集計します。
+
+```bash
+cmake --build build --parallel 2
+XRT_COMPOSITOR_FORCE_DRM=1 \
+XRT_COMPOSITOR_DRM_DEVICE=/dev/dri/card0 \
+XRT_COMPOSITOR_DRM_CONNECTOR=DP-1 \
+XRT_COMPOSITOR_DRM_MODE=3840x1920@90.001 \
+XRT_COMPOSITOR_DRM_ALLOW_STRETCH=1 \
+XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
+XRT_COMPOSITOR_LOG=info \
+./build/src/xrt/targets/service/monado-service 2>&1 | tee /tmp/monado-drm-90hz.log
+```
+
+別のターミナルで従来通り hello_xr を起動します。同じ場面・画質・GPU・姿勢で、起動直後の約5秒を除き、
+60秒程度のログを採取してください。hello_xr を終了しサービスを Ctrl-C で終了します。
+72 Hz と比較するときはモードを `3840x1920@71.998`、保存先を別名にします。
+
+ログの形式（値は例ではなく項目名の説明）:
+
+- `mode`: 選択した KMS モードの refresh。アプリ FPS ではありません。
+- `update_fps`: 120 / page-flip 間隔の合計秒数。コンポジタが実際に FB を更新した頻度です。
+  同じアプリ画像の再合成も数えるため、アプリが生成した新規フレーム数とは異なります。
+- `interval_ms[min/p50/p95/max]`: イベント間隔の最小値、中央値、nearest-rank の95パーセンタイル、最大値。
+  各約120区間の集計です。ブロックの p95 を平均して全測定期間の p95 として扱わないでください。
+- `vblanks_without_update`: 隣接イベントの sequence 差から計算した、FB 更新を行わなかった表示周期数。
+  低いアプリ更新率、pacing、GPU 待ちなどを区別せず数えます。アプリの dropped frame 数ではありません。
+- `multi_vblank_intervals`: 2表示周期以上をまたいだ更新間隔の数。
+  sequence を取得できない場合 `vblanks_without_update=-1` になり、sequence に基づく値は評価できません。
+
+90 Hz なら1周期は約11.111 ms、2周期は約22.222 msです。
+更新 FPS が90に近く、p95も1周期に近く、更新なし周期が少ないかを確認します。
+これは判定基準であり、今回の実機結果を予言するものではありません。
+1秒超の pause または timestamp の後退は不連続と扱い、途中の集計窓を破棄します。
+そのため長い停止を含む全体の平均 FPS は、このログから算出しません。
+
+イベント間の時刻差だけを使い、CPU/Vulkan の時計との一致を仮定しません。
+KMS timestamp は kernel が報告する flip 時刻で、HMD の実発光時刻、姿勢から表示までの遅延、
+パネルの残像は測定しません。Mali-G610 の提示ログでは GPU timestamp が利用不可なので、
+従来の `release/GPU wait` は CPU が計った queue 完了待ち時間として扱います。
+
+計測コードの回帰テストには、90 Hz相当のイベント列、1周期の更新抜け、sequence の32bit wrap、
+pause、時刻後退と sequence がない場合を含めています。
