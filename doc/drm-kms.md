@@ -34,7 +34,7 @@ acquire ownership barrier は renderer と同じ queue に非同期 submit し�
 acquire と release の command buffer は別です。release は renderer の binary semaphore を1回消費し、
 FOREIGN ownership barrier の完了 fence を `VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT` で export します。
 選択 plane の `IN_FENCE_FD` があれば、nonblocking atomic commit に sync FD を添付します。
-提示された Rockchip ログにはこの property がないため、Rockchip では DMA-BUF reservation の
+初期の modetest ログではこの property を確認できなかったため、Rockchip では DMA-BUF reservation の
 `DMA_BUF_IOCTL_IMPORT_SYNC_FILE`（WRITE）経路も実装しました。
 Linux 6.18 の [atomic helper](https://github.com/torvalds/linux/blob/v6.18/drivers/gpu/drm/drm_atomic_helper.c) は
 GEM plane の prepare_fb が未指定の場合に reservation fence を抽出します。
@@ -323,7 +323,8 @@ AArch64 は変更モジュールの object compile まで確認しました。
 | 71.998 Hz | 1680 | 71.96 FPS | 1 / 1680 | 1 |
 | 90.001 Hz | 3120 | 86.56 FPS | 124 / 3120 | 124 |
 
-今回の sync FD 経路の実機表示・更新率・終了時復元は未検証です。
+追加の実機ログ `ArparaOpiLog/2` で sync FD 経路の KMS 更新率を確認しました（下記）。
+終了時復元と光学的な遅延・残像は、このログでは未確認です。
 ローカルには DRM card / PanVK / HMD がないため、コンパイルと fault injection で検証しています。
 `syncfd-build.log`、`syncfd-tests.log`、`syncfd-arm.log` は `build/kms-validation/` に保存します。
 全体ビルドと CTest **32/32** が成功しました。テストには sync FD export の CPU 待ちゼロ、
@@ -357,3 +358,40 @@ XRT_COMPOSITOR_LOG=info \
 最後は hello_xr とサービスを終了し、`Previous atomic KMS state restored` を確認してください。
 新経路に失敗した場合はエラー行を含むログを保存し、`0` で既存経路へ戻せます。
 画面比率・光学校正・IMU はこの変更の対象にしていません。
+
+
+## sync FD 実機測定（ArparaOpiLog/2）
+
+`608615e4c` のログ全体を集計しました。GPU は Mali-G610、KMS は Rockchip、
+connector=84 / CRTC=82 / plane=39、3840×1920、XRGB8888 / LINEAR、pitch=15360、画像3枚です。
+**選択 plane の IN_FENCE_FD は実機で supported と確認でき、実際にこの経路が選ばれています。**
+DMA-BUF reservation による暗黙同期の代替経路は今回使われておらず、実機未検証です。
+CPU pixel copy と CPU release fence wait はどちらも0と記録されています。
+
+| モード | 集計窓 | 対象区間 | 対象時間（概算） | 更新率 | 複数vblank間隔 / 対象区間 | release submit/export 平均 |
+|---|---:|---:|---:|---:|---:|---:|
+| 71.998 Hz | 19 | 2280 | 31.68秒 | 71.97 FPS | 1 / 2280（0.044%） | 0.175 ms |
+| 90.001 Hz | 22 | 2640 | 29.91秒 | 88.26 FPS | 52 / 2640（1.970%） | 0.162 ms |
+
+区間数で重み付けした更新率を算出し、起動窓を含めています。記録された丸め値からの概算です。
+72 Hz の更新抜け1回は最初の集計窓で、その後18窓では更新抜け0でした。
+90 Hz は前回 `ArparaOpiLog/1` の86.56 FPS / 3.974%から、今回88.26 FPS / 1.970%です。
+短時間・異なる採取期間の比較で、すべての負荷条件で同じ改善や90 FPS維持を保証しません。
+
+各窓の中央値は72 Hzで13.889 ms、90 Hzで11.111 msでした。
+窓ごとのp95範囲はそれぞれ13.891〜13.958 ms、11.116〜11.185 msです。
+全測定期間のp95はこの集計済みログから再構成できません。
+最大更新間隔は72 Hzで27.773 ms、90 Hzで22.289 msで、90 Hzには2周期の更新間隔が残ります。
+
+従来の約10.65 / 10.85 msはCPUによるGPU完了待ち、新しい0.175 / 0.162 msは
+release submission と sync FD export のCPU経過時間です。GPU描画時間の短縮とは解釈しません。
+前の flip drain/commit は72 Hzで平均13.126 ms、90 Hzで5.444 msでした。
+新経路ではGPU完了を待つ前にcommitできるため、この待機位置と重なり方が変わります。
+数値が増えたことだけで性能低下と判断せず、KMSイベント間隔と更新抜けで評価します。
+
+両ログに ERROR / timeout はありません。どちらにも `Previous atomic KMS state restored` と
+`Server exiting` の行がないため、終了時復元の成否は確認できません。
+次の採取では `tee -i` を使い、hello_xrを止めてからサービスをCtrl-Cで終了し、復元行を保存してください。
+残る90 Hz更新抜けの切り分けには renderer の共有リソース保護によるfence待ち、CPU描画準備、
+GPU合成とvblankの位相を別々に計測する必要があります。共有リソースを保護する待ちは現時点で維持しています。
+解析結果は `build/kms-validation/syncfd-hardware-summary.json` に保存しています。
