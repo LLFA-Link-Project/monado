@@ -417,3 +417,40 @@ GPU合成とvblankの位相を別々に計測する必要があります。共�
 release submit/export は全19窓の平均0.163 ms、前のflip drain/commitは5.300 msでした。
 解析結果は `build/kms-validation/syncfd-hardware-run3.json` に保存しています。
 このログ確認ではソース・表示経路を変更しておらず、ビルド/テストの再実行は行っていません。
+
+
+## 今後改善の可能性（当面は現状維持）
+
+2026-10-10 時点では、ユーザーが現在の動作を十分と判断したため、性能改修はここで一区切りとします。
+この節は後続作業の候補であり、実装済み・効果確認済みという意味ではありません。
+
+現状は Orange Pi 5 / Mali-G610 / PanVK → BGRA8 LINEAR DMA-BUF → Rockchip KMS → arpara の経路です。
+3画像、IN_FENCE_FD、CPU pixel copy / release fence wait とも0、正常終了時のKMS復元を確認しています。
+72 Hz は約71.97 FPS、90 Hz は約88.26〜88.49 FPS（後者の88.49は最初の集計窓を除く値）でした。
+90 Hzの完全維持、光学的な遅延・残像、IMU追跡とレンズ校正を達成したとは扱いません。
+再開時も既存の Rust protocol/HID/IMU、非WSI表示経路、成功済みの同期・再利用条件を保全します。
+
+| 優先 | 候補 | 期待すること・最初の検証 |
+|---|---|---|
+| 1 | 残る待ち時間を分けて計測 | renderer の共有リソース保護のfence待ち、CPU描画準備、queue submit、KMS commit/eventを別々に記録する。90 Hzで2周期になるフレームと対応付け、最初の約578 msの長い間隔の原因も調べる。 |
+| 2 | renderer リソースをフレームごとに分離 | descriptor pool、mapped UBO、command buffer、scratch画像、query poolなどの共有箇所と寿命を先に棚卸しする。GPU使用中のCPU書き換えを防ぎ、各フレームのfenceとscanout退役で管理できれば、次フレームの準備を重ねられる可能性がある。単純に現在のfence待ちを削除しない。 |
+| 3 | vblank位相とpacingを改善 | 現在の即時wake・1周期の予測予算を基準に、実測したGPU完了/flip情報でdeadlineと描画開始を調整する。更新抜けと予測誤差を同時に評価し、FPSだけのために先行フレーム数を増やさない。光学的なpresent-to-photon offsetは別途校正が必要。 |
+| 4 | modifier交渉・メモリ帯域の改善 | LINEAR以外のformat/modifierをPanVKとKMSで照会し、実renderer usageでのexportability、plane layout、import、TEST_ONLYを確認する。共通候補があれば帯域と合成時間を比較する。AFBC対応や効果は未確認で、stride/offsetの推測やBSPへの移行は行わない。 |
+| 5 | 描画負荷と画面比率を整理 | 同じ物理モードを保ち、アプリの推奨描画解像度・合成負荷を段階的に比較してGPU側の余裕を測る。HMDの暫定2560×1440と出力3840×1920を仕様として同一視せず、左右のviewport・FOV・表示配置を調べてALLOW_STRETCH依存を解消する。画質低下を性能向上と混同しない。 |
+| 6 | 長時間・異常系の検証 | 新規起動、クライアント停止/再接続、SIGINT、hotplug、master喪失、device lossとcommit失敗を個別に確認する。FD/GEM/fenceのリークと再利用を検査し、復元不能時は失敗理由を記録する。Rockchipのreservation同期代替経路はIN_FENCE_FD経路と別に実機検証する。 |
+
+パネルの残像・モーションブラーや姿勢から表示までの遅延は、KMSの更新FPSだけでは判断できません。
+必要になった段階で光学計測を検討し、アプリの新規フレーム率、コンポジタの再合成率、物理refreshを区別します。
+正確なレンズ歪みを扱う場合は、配置を確認して `ArparaHIDProtocolReverseEnginiering/arpara-original.json`
+などの資料を参照し、値の出典と対象個体・表示モードへの適合性を確認します。
+
+再開時の比較条件は、同じhello_xr設定・GPU0・3840×1920、72/90 Hzを別々に測定することです。
+各試行は60秒以上を目安に、起動を含む全体と開始5秒後の区間を分け、`tee -i`で正常終了まで保存します。
+区間を厳密に切り出す必要がある場合はフレームごとの時刻記録を追加します。
+現在の120区間ごとの集計ログから全期間のp95や任意の5秒境界を再構成しません。
+比較対象は `XRT_COMPOSITOR_DRM_SYNC_FD=0/1`、指標はKMS update_fps、更新なしvblank、
+更新間隔の分布、CPU待ち時間、必要に応じて光学的な遅延です。
+バッファ数を増やす場合は、遅延増加とreprojection時の姿勢の鮮度も評価します。
+ユーザー権限・seat・OS設定は無断で変更せず、各変更の効果を確認してから次の候補へ進みます。
+
+このメモの追加ではソース変更・ビルド・テストの再実行は行っていません。
