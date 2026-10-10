@@ -238,13 +238,26 @@ TEST_CASE("arpara real HMD creation, startup, fusion and disconnect with fake HI
 	}));
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0);
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
 	CHECK(pose.pose.position.x == 0);
+	CHECK(pose.pose.position.y == 0);
+	CHECK(pose.pose.position.z == 0);
 	CHECK(d->get_tracked_pose(d, XRT_INPUT_GENERIC_GRIP_POSE, 0, &pose) == XRT_ERROR_INPUT_UNSUPPORTED);
 	hid->unplugged = true;
 	CHECK(wait_until([&] {
 		d->get_tracked_pose(d, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &pose);
 		return !(pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 	}));
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
+	CHECK(pose.pose.position.x == 0);
+	CHECK(pose.pose.position.y == 0);
+	CHECK(pose.pose.position.z == 0);
+	CHECK(fabsf(pose.pose.orientation.y) > 0.01f); // Disconnect retains the IMU orientation.
+	const auto &q = pose.pose.orientation;
+	CHECK(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w == Catch::Approx(1.0f));
 	xrt_device_destroy(&d);
 	CHECK(closed);
 }
@@ -281,10 +294,41 @@ TEST_CASE("arpara fixed registration mode sends no HID commands", "[.][fixed]")
 	auto *d = arpara_create(&hid->base);
 	REQUIRE(d != nullptr);
 	CHECK_FALSE(d->supported.orientation_tracking);
+	CHECK_FALSE(d->supported.position_tracking);
 	xrt_space_relation pose{};
 	CHECK(d->get_tracked_pose(d, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &pose) == XRT_SUCCESS);
 	CHECK(pose.pose.orientation.w == 1);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) == 0);
+	CHECK(pose.pose.position.x == 0);
+	CHECK(pose.pose.position.y == 0);
+	CHECK(pose.pose.position.z == 0);
+	xrt_space_relation head{};
+	xrt_fov fovs[2]{};
+	xrt_pose views[2]{};
+	const xrt_vec3 eye_relation = {0.065f, 0, 0}; // Test input, not a calibrated IPD.
+	CHECK(d->get_view_poses(d, &eye_relation, os_monotonic_get_ns(), XRT_VIEW_TYPE_STEREO, 2, &head, fovs,
+	                        views) == XRT_SUCCESS);
+	CHECK((head.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+	CHECK((head.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
+	CHECK((head.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
+	CHECK((head.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) == 0);
+	CHECK(head.pose.position.x == 0);
+	CHECK(head.pose.position.y == 0);
+	CHECK(head.pose.position.z == 0);
+	CHECK(head.pose.orientation.w == 1);
+	CHECK(views[0].position.x == Catch::Approx(-0.0325f));
+	CHECK(views[1].position.x == Catch::Approx(0.0325f));
+	for (const auto &view : views) {
+		CHECK(view.position.y == 0);
+		CHECK(view.position.z == 0);
+		CHECK(view.orientation.x == 0);
+		CHECK(view.orientation.y == 0);
+		CHECK(view.orientation.z == 0);
+		CHECK(view.orientation.w == 1);
+	}
 	CHECK(hid->completed == 0);
 	xrt_device_destroy(&d);
 	CHECK(closed);
@@ -315,6 +359,9 @@ TEST_CASE("arpara startup timeout keeps an untracked HMD and shutdown is bounded
 	xrt_space_relation pose{};
 	d->get_tracked_pose(d, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns(), &pose);
 	CHECK(pose.pose.orientation.w == 1);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
+	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) == 0);
 	auto before = std::chrono::steady_clock::now();
 	xrt_device_destroy(&d);

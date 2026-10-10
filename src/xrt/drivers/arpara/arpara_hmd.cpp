@@ -211,7 +211,10 @@ get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at_timestamp
 	*out = {};
 	os_mutex_lock(&h->mutex);
 	out->pose.orientation = h->orientation;
-	out->relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+	/* 3DoF uses a valid fixed origin, without claiming position tracking.
+	 * OpenXR clients need both valid components to locate VIEW in STAGE. */
+	out->relation_flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+	                                                    XRT_SPACE_RELATION_POSITION_VALID_BIT);
 	if (!h->disconnected && h->orientation_ready && os_monotonic_get_ns() - h->last_host_ns < 100000000) {
 		out->relation_flags =
 		    (enum xrt_space_relation_flags)(out->relation_flags | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
