@@ -11,8 +11,18 @@ target_include_directories(drv_includes INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
 
 if(XRT_BUILD_DRIVER_ARPARA)
+	set(ARPARA_CALIBRATION_JSON "${CMAKE_CURRENT_SOURCE_DIR}/arpara/calibration/optics.json"
+	    CACHE FILEPATH "arpara optical calibration for the connected unit (full or optics-only JSON)")
+	set(_arpara_optics_header "${CMAKE_CURRENT_BINARY_DIR}/arpara_optics_generated.h")
+	add_custom_command(OUTPUT "${_arpara_optics_header}"
+	    COMMAND ${PYTHON_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/arpara/calibration/embed_calibration.py"
+	            "${ARPARA_CALIBRATION_JSON}" "${_arpara_optics_header}"
+	    DEPENDS "${ARPARA_CALIBRATION_JSON}" arpara/calibration/embed_calibration.py
+	    VERBATIM)
 	add_subdirectory(arpara/rust)
-	add_library(drv_arpara STATIC arpara/arpara_hmd.cpp arpara/arpara_interface.h arpara/arpara_protocol.h)
+	add_library(drv_arpara STATIC arpara/arpara_hmd.cpp arpara/arpara_interface.h arpara/arpara_protocol.h
+	    arpara/arpara_optics.cpp arpara/arpara_optics.h "${_arpara_optics_header}")
+	target_include_directories(drv_arpara PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 	target_link_libraries(drv_arpara PRIVATE xrt-interfaces aux_util aux_os aux_math arpara_rust)
 	list(APPEND ENABLED_HEADSET_DRIVERS arpara)
 endif()

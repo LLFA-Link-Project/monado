@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 #include "arpara_interface.h"
 #include "arpara_protocol.h"
+#include "arpara_optics.h"
 #include "math/m_imu_3dof.h"
 #include "os/os_hid.h"
 #include "os/os_threading.h"
@@ -23,6 +24,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(arpara_imu, "ARPARA_IMU", true)
 struct arpara_hmd
 {
 	struct xrt_device base;
+	struct arpara_optics optics;
 	struct os_hid_device *hid;
 	struct os_thread_helper thread;
 	struct os_mutex mutex;
@@ -224,6 +226,13 @@ get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at_timestamp
 }
 
 static xrt_result_t
+compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
+{
+	struct arpara_hmd *h = (struct arpara_hmd *)xdev;
+	return arpara_optics_compute(&h->optics, view, u, v, result) ? XRT_SUCCESS : XRT_ERROR_INPUT_UNSUPPORTED;
+}
+
+static xrt_result_t
 get_mask(struct xrt_device *xdev, enum xrt_visibility_mask_type type, uint32_t view, struct xrt_visibility_mask **out)
 {
 	if (view >= xdev->hmd->view_count) {
@@ -296,10 +305,30 @@ arpara_create(struct os_hid_device *hid)
 		return NULL;
 	}
 	d->hmd->screens[0].nominal_frame_interval_ns = 16666667; // Placeholder 60 Hz.
-	u_distortion_mesh_set_none(d);
-	U_LOG_W(
-	    "arpara: provisional 2560x1440/60Hz, 90deg FOV, 65mm lens separation, no distortion; identity pose until "
-	    "IMU arrives");
+	if (!arpara_optics_load_builtin(&h->optics)) {
+		U_LOG_E("arpara: optical calibration failed; refusing an uncalibrated fallback");
+		destroy(d);
+		return NULL;
+	}
+	for (unsigned eye = 0; eye < 2; ++eye) {
+		d->hmd->views[eye].display.w_pixels = h->optics.recommended_width;
+		d->hmd->views[eye].display.h_pixels = h->optics.recommended_height;
+		d->hmd->distortion.fov[eye] = h->optics.fov[eye];
+	}
+	d->compute_distortion = compute_distortion;
+	d->hmd->distortion.models = XRT_DISTORTION_MODEL_COMPUTE;
+	d->hmd->distortion.preferred = XRT_DISTORTION_MODEL_COMPUTE;
+	u_distortion_mesh_fill_in_compute(d);
+	if (!d->hmd->distortion.mesh.vertices || !d->hmd->distortion.mesh.indices) {
+		U_LOG_E("arpara: distortion mesh generation failed");
+		destroy(d);
+		return NULL;
+	}
+	U_LOG_I("arpara: loaded DISTORT_POLY3 optics, source SHA-256=%s, eye target=%ux%u; mesh generated",
+	        arpara_optics_source_hash(), h->optics.recommended_width, h->optics.recommended_height);
+	U_LOG_W("arpara: optics from supplied unit calibration; RGB shares green where color fields are absent. "
+	        "IPD, IMU-to-eye transform and provisional 2560x1440/60Hz registration geometry remain uncalibrated; "
+	        "DRM physical mode is selected separately.");
 	if (d->supported.orientation_tracking && os_thread_helper_start(&h->thread, reader, h) != 0) {
 		U_LOG_E("arpara: failed to start HID reader");
 		destroy(d);

@@ -9,6 +9,7 @@
 #include "target_lists.h"
 #include "xrt/xrt_device.h"
 #include <array>
+#include <cmath>
 #include <functional>
 #include <atomic>
 #include <chrono>
@@ -222,6 +223,24 @@ TEST_CASE("arpara real HMD creation, startup, fusion and disconnect with fake HI
 	u_device_assign_xdev_roles(xdevs, 1, &head, &eyes, &face, &left, &right, &gamepad);
 	CHECK(head == 0); // Same role assignment function as the legacy builder.
 	CHECK(d->hmd->view_count == 2);
+	CHECK((d->hmd->distortion.models & XRT_DISTORTION_MODEL_COMPUTE) != 0);
+	CHECK((d->hmd->distortion.models & XRT_DISTORTION_MODEL_MESHUV) != 0);
+	CHECK((d->hmd->distortion.models & XRT_DISTORTION_MODEL_NONE) == 0);
+	REQUIRE(d->hmd->distortion.mesh.vertices != nullptr);
+	REQUIRE(d->hmd->distortion.mesh.indices != nullptr);
+	CHECK(d->hmd->views[0].display.w_pixels == 2544);
+	CHECK(d->hmd->views[1].display.h_pixels == 2544);
+	xrt_uv_triplet distortion{};
+	CHECK(d->compute_distortion(d, 0, .5f, .5f, &distortion) == XRT_SUCCESS);
+	CHECK(distortion.g.x == Catch::Approx(.5f));
+	CHECK(distortion.g.y == Catch::Approx(.5f));
+	CHECK(d->compute_distortion(d, 2, .5f, .5f, &distortion) == XRT_ERROR_INPUT_UNSUPPORTED);
+	const auto &mesh = d->hmd->distortion.mesh;
+	for (uint32_t i = 0; i < mesh.vertex_count; ++i) {
+		for (unsigned component = 0; component < 8; ++component)
+			REQUIRE(std::isfinite(mesh.vertices[i * mesh.stride / sizeof(float) + component]));
+	}
+
 	CHECK_FALSE(d->supported.position_tracking);
 	CHECK(wait_until([&] { return hid->completed == 15; }));
 	CHECK(hid->acks == 1);

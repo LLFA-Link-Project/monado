@@ -1,0 +1,38 @@
+{
+  "source_sha256": "267b5215f0856749d77ef3ed0acf03bb5ce6f8e434c7a1b93a6bbd4fd27c070c",
+  "device": {
+      "eye_target_height_in_pixels" : 2544,
+      "eye_target_width_in_pixels" : 2544,
+      "first_eye" : "eEYE_LEFT",
+      "last_eye" : "eEYE_RIGHT",
+      "num_windows" : 1
+   },
+  "tracking_to_eye_transform": [
+      {
+         "distortion" : {
+            "coeffs" : [ 0.172767789, 0.015039393, 0.055597464999999999 ],
+            "type" : "DISTORT_POLY3"
+         },
+         "grow_for_undistort" : 0.600000024,
+         "intrinsics" : [
+            [ 1.33599997, 0, 0 ],
+            [ 0, 1.33599997, 0 ],
+            [ 0, 0, 1 ]
+         ],
+         "undistort_r2_cutoff" : 1.39999998
+      },
+      {
+         "distortion" : {
+            "coeffs" : [ 0.172767789, 0.015039393, 0.055597464999999999 ],
+            "type" : "DISTORT_POLY3"
+         },
+         "grow_for_undistort" : 0.600000024,
+         "intrinsics" : [
+            [ 1.33599997, 0, 0 ],
+            [ 0, 1.33599997, 0 ],
+            [ 0, 0, 1 ]
+         ],
+         "undistort_r2_cutoff" : 1.39999998
+      }
+   ]
+}

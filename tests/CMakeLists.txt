@@ -58,7 +58,7 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 endif()
 
 if(XRT_BUILD_DRIVER_ARPARA)
-	list(APPEND tests tests_arpara)
+	list(APPEND tests tests_arpara tests_arpara_optics)
 endif()
 
 if(XRT_HAVE_DRM_KMS AND XRT_MODULE_COMPOSITOR_MAIN)
@@ -154,6 +154,8 @@ if(XRT_HAVE_VULKAN AND XRT_HAVE_D3D12)
 endif()
 
 if(XRT_BUILD_DRIVER_ARPARA)
+	target_link_libraries(tests_arpara_optics PRIVATE drv_arpara drv_includes aux_math)
+	target_compile_definitions(tests_arpara_optics PRIVATE ARPARA_OPTICS_FIXTURE="${PROJECT_SOURCE_DIR}/src/xrt/drivers/arpara/calibration/optics.json")
 	target_link_libraries(tests_arpara PRIVATE drv_arpara drv_includes aux_os target_lists)
 	target_include_directories(tests_arpara PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common)
 	if(XRT_HAVE_LIBUDEV)
