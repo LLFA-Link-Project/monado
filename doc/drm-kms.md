@@ -395,3 +395,25 @@ release submission と sync FD export のCPU経過時間です。GPU描画時間
 残る90 Hz更新抜けの切り分けには renderer の共有リソース保護によるfence待ち、CPU描画準備、
 GPU合成とvblankの位相を別々に計測する必要があります。共有リソースを保護する待ちは現時点で維持しています。
 解析結果は `build/kms-validation/syncfd-hardware-summary.json` に保存しています。
+
+
+## 正常終了を含む追加確認（ArparaOpiLog/3）
+
+90.001 Hz、`608615e4c` のログ全体を確認しました。
+今回も Mali-G610 / Rockchip / IN_FENCE_FD が選択され、CPU release fence wait / pixel copy は0です。
+終了部に `Previous atomic KMS state restored` と `Server exiting: '0'` があり、
+**この実行のKMS復元とサービス正常終了をログで確認できました。** ERROR / timeout はありません。
+
+| 対象 | 区間数 | 対象時間（概算） | 更新率 | 複数vblank間隔 | 更新なしvblank | 最大更新間隔 |
+|---|---:|---:|---:|---:|---:|---:|
+| 全19窓 | 2280 | 26.34秒 | 86.55 FPS | 41 | 91 | 577.718 ms |
+| 最初の窓を除く18窓 | 2160 | 24.41秒 | 88.49 FPS | 37（1.713%） | 37 | 22.318 ms |
+
+最初の窓に約578 msの長い更新間隔があり、全体の平均を下げています。
+この間隔の原因はログだけでは特定できません。最初の窓を除く値を全体の値として扱わないでください。
+同窓には複数vblank間隔4件・更新なし54周期があり、長い停止1回は多くの表示周期を含みます。
+残り18窓は前回の約88.26 FPSに近い値ですが、2周期ごとの更新は残っています。
+全窓のp95は11.113〜11.184 ms、中央値は11.111 msで、これらは各窓の統計値です。
+release submit/export は全19窓の平均0.163 ms、前のflip drain/commitは5.300 msでした。
+解析結果は `build/kms-validation/syncfd-hardware-run3.json` に保存しています。
+このログ確認ではソース・表示経路を変更しておらず、ビルド/テストの再実行は行っていません。
