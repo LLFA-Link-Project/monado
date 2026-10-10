@@ -97,6 +97,9 @@ struct vk_bundle
 	 */
 	struct vk_bundle_queue queues[VK_BUNDLE_MAX_QUEUES];
 
+	//! Number of queue mutexes successfully initialized (also handles partial initialization).
+	uint32_t queue_mutex_count;
+
 	/*!
 	 * @brief Main queue for general work.
 	 *

@@ -36,6 +36,7 @@ if(XRT_HAVE_VULKAN)
 		APPEND
 		tests
 		tests_comp_client_vulkan
+		tests_vk_queue_mutex
 		tests_uv_to_tangent
 		tests_render_pipeline_cache
 		)
@@ -173,4 +174,8 @@ if(XRT_BUILD_DRIVER_ARPARA)
 		${ARPARA_CARGO} test --offline --locked ${_arpara_rust_test_args}
 		--manifest-path "${PROJECT_SOURCE_DIR}/src/xrt/drivers/arpara/rust/Cargo.toml"
 		--target-dir "${PROJECT_BINARY_DIR}/arpara-rust-tests")
+endif()
+
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(tests_vk_queue_mutex PRIVATE aux_vk)
 endif()

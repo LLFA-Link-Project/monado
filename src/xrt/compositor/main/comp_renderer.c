@@ -610,6 +610,10 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 	}
 
 	comp_target_create_images(target, &info, r->c->base.vk.main_queue);
+	if (!comp_target_has_images(target) || target->image_count == 0) {
+		COMP_ERROR(c, "Target failed to allocate images");
+		return false;
+	}
 
 	bool pre_rotate = false;
 	if (target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
@@ -817,6 +821,7 @@ renderer_acquire_swapchain_image(struct comp_renderer *r)
 
 	if (ret != VK_SUCCESS) {
 		COMP_ERROR(r->c, "comp_target_acquire: %s", vk_result_string(ret));
+		return;
 	}
 
 	r->acquired_buffer = buffer_index;
@@ -1121,6 +1126,10 @@ comp_renderer_draw(struct comp_renderer *r)
 		// Ensures that renderings are created.
 		renderer_acquire_swapchain_image(r);
 	}
+	if (r->acquired_buffer < 0) {
+		comp_frame_clear_locked(&c->frame.rendering);
+		return XRT_ERROR_VULKAN;
+	}
 
 	comp_target_update_timings(ct);
 
@@ -1203,7 +1212,7 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Clear the rendered frame.
 	comp_frame_clear_locked(&c->frame.rendering);
 
-	xrt_result_t xret = XRT_SUCCESS;
+	xrt_result_t xret = !present_success && strcmp(ct->name, "drm_kms") == 0 ? XRT_ERROR_VULKAN : XRT_SUCCESS;
 	comp_mirror_fixup_ui_state(&r->mirror_to_debug_gui, c);
 	if (comp_mirror_is_ready_and_active(&r->mirror_to_debug_gui, c, predicted_display_time_ns)) {
 

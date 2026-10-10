@@ -33,6 +33,9 @@ extern "C" {
  * @ingroup comp_main
  */
 extern const struct comp_target_factory comp_target_factory_debug_image;
+#ifdef XRT_HAVE_DRM_KMS
+extern const struct comp_target_factory comp_target_factory_drm_kms;
+#endif
 
 #ifdef VK_USE_PLATFORM_XCB_KHR
 

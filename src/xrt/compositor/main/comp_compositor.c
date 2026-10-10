@@ -660,7 +660,8 @@ select_instances_extensions(struct comp_compositor *c,
                             struct u_extension_list_builder *optional_builder)
 {
 #ifdef XRT_FEATURE_WINDOW_PEEK
-	if (!comp_window_peek_get_vk_instance_exts(required_builder)) {
+	if (strcmp(c->target_factory->identifier, "drm_kms") != 0 &&
+	    !comp_window_peek_get_vk_instance_exts(required_builder)) {
 		COMP_WARN(c, "Failed to get vulkan instance extensions for peek window.");
 	}
 #endif
@@ -684,11 +685,12 @@ compositor_init_vulkan(struct comp_compositor *c)
 	struct u_extension_list_builder *required_instance_ext_builder = u_extension_list_builder_create();
 	struct u_extension_list_builder *optional_instance_ext_builder = u_extension_list_builder_create();
 
-	// Every backend needs at least the common extensions.
-	u_extension_list_builder_append_array(       //
-	    required_instance_ext_builder,           //
-	    instance_extensions_common,              //
-	    ARRAY_SIZE(instance_extensions_common)); //
+	bool non_wsi = strcmp(c->target_factory->identifier, "drm_kms") == 0;
+	for (size_t i = 0; i < ARRAY_SIZE(instance_extensions_common); i++) {
+		if (non_wsi && strcmp(instance_extensions_common[i], VK_KHR_SURFACE_EXTENSION_NAME) == 0)
+			continue;
+		u_extension_list_builder_append(required_instance_ext_builder, instance_extensions_common[i]);
+	}
 
 	// Add per target required extensions.
 	u_extension_list_builder_append_array(                     //
@@ -696,11 +698,12 @@ compositor_init_vulkan(struct comp_compositor *c)
 	    c->target_factory->required_instance_extensions,       //
 	    c->target_factory->required_instance_extension_count); //
 
-	// Optional instance extensions.
-	u_extension_list_builder_append_array(         //
-	    optional_instance_ext_builder,             //
-	    optional_instance_extensions,              //
-	    ARRAY_SIZE(optional_instance_extensions)); //
+	for (size_t i = 0; i < ARRAY_SIZE(optional_instance_extensions); i++) {
+		const char *ext = optional_instance_extensions[i];
+		if (non_wsi && strcmp(ext, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) != 0)
+			continue;
+		u_extension_list_builder_append(optional_instance_ext_builder, ext);
+	}
 
 	if (!select_instances_extensions(c, required_instance_ext_builder, optional_instance_ext_builder)) {
 		COMP_ERROR(c, "Failed to select additional instance extensions.");
@@ -723,17 +726,19 @@ compositor_init_vulkan(struct comp_compositor *c)
 	struct u_extension_list_builder *required_device_ext_builder = u_extension_list_builder_create();
 	struct u_extension_list_builder *optional_device_ext_builder = u_extension_list_builder_create();
 
-	// Required device extensions.
-	u_extension_list_builder_append_array(       //
-	    required_device_ext_builder,             //
-	    required_device_extensions,              //
-	    ARRAY_SIZE(required_device_extensions)); //
+	for (size_t i = 0; i < ARRAY_SIZE(required_device_extensions); i++) {
+		if (non_wsi && strcmp(required_device_extensions[i], VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
+			continue;
+		u_extension_list_builder_append(required_device_ext_builder, required_device_extensions[i]);
+	}
 
-	// Optional device extensions.
-	u_extension_list_builder_append_array(       //
-	    optional_device_ext_builder,             //
-	    optional_device_extensions,              //
-	    ARRAY_SIZE(optional_device_extensions)); //
+	for (size_t i = 0; i < ARRAY_SIZE(optional_device_extensions); i++) {
+		const char *ext = optional_device_extensions[i];
+		if (non_wsi && (strstr(ext, "present") || strstr(ext, "swapchain") || strstr(ext, "display_control") ||
+		                strstr(ext, "full_screen_exclusive")))
+			continue;
+		u_extension_list_builder_append(optional_device_ext_builder, ext);
+	}
 
 	// Add per target optional device extensions.
 	u_extension_list_builder_append_array(                   //
@@ -837,6 +842,9 @@ const struct comp_target_factory *ctfs[] = {
 #endif
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
     &comp_target_factory_vk_display,
+#endif
+#ifdef XRT_HAVE_DRM_KMS
+    &comp_target_factory_drm_kms,
 #endif
     &comp_target_factory_debug_image,
 };
@@ -1055,7 +1063,7 @@ compositor_init_renderer(struct comp_compositor *c)
 	c->r = comp_renderer_create(c, c->view_extents);
 
 #ifdef XRT_FEATURE_WINDOW_PEEK
-	c->peek = comp_window_peek_create(c);
+	c->peek = strcmp(c->target_factory->identifier, "drm_kms") == 0 ? NULL : comp_window_peek_create(c);
 #else
 	c->peek = NULL;
 #endif

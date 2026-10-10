@@ -1,0 +1,328 @@
+// Copyright 2026, OpenAI.
+// SPDX-License-Identifier: BSL-1.0
+#include "main/comp_window.h"
+#include "comp_drm_kms.h"
+#include "comp_drm_readback.h"
+#include "util/u_pacing.h"
+#include <stdlib.h>
+#include <string.h>
+struct drm_kms_target
+{
+	struct comp_target base;
+	struct comp_drm_kms *kms;
+	struct comp_drm_readback *readback[2];
+	struct comp_target_image images[2];
+	struct u_pacing_compositor *upc;
+	int64_t index;
+	unsigned next;
+	bool has_init_vulkan, failed;
+};
+static bool
+target_init_pre_vulkan(struct comp_target *ct)
+{
+	struct drm_kms_target *t = (void *)ct;
+	const char *connector = getenv("XRT_COMPOSITOR_DRM_CONNECTOR"), *mode = getenv("XRT_COMPOSITOR_DRM_MODE");
+	if (!connector || !mode || !*connector || !*mode) {
+		COMP_ERROR(ct->c,
+		           "DRM requires explicit XRT_COMPOSITOR_DRM_CONNECTOR and XRT_COMPOSITOR_DRM_MODE "
+		           "(WIDTHxHEIGHT@HZ, three decimals); enumerate with monado-kms-probe --list.");
+		return false;
+	}
+	t->kms = comp_drm_kms_open(getenv("XRT_COMPOSITOR_DRM_DEVICE"), stderr);
+	if (!t->kms || !comp_drm_kms_prepare(t->kms, connector, mode, 0))
+		return false;
+	uint32_t w = comp_drm_kms_width(t->kms), h = comp_drm_kms_height(t->kms);
+	struct comp_settings *s = &ct->c->settings;
+	if ((uint64_t)w * s->preferred.height != (uint64_t)h * s->preferred.width) {
+		const char *allow = getenv("XRT_COMPOSITOR_DRM_ALLOW_STRETCH");
+		if (!allow || strcmp(allow, "1")) {
+			COMP_ERROR(ct->c,
+			           "HMD provisional extent %ux%u and KMS mode %ux%u have different aspect ratios. "
+			           "Explicit DRM_ALLOW_STRETCH=1 required for diagnostic output.",
+			           s->preferred.width, s->preferred.height, w, h);
+			return false;
+		}
+		COMP_WARN(ct->c,
+		          "Explicit diagnostic anisotropic scaling %ux%u -> %ux%u; optical calibration unresolved.",
+		          s->preferred.width, s->preferred.height, w, h);
+	}
+	s->preferred.width = w;
+	s->preferred.height = h;
+	s->nominal_frame_interval_ns = comp_drm_kms_period_ns(t->kms);
+	u_pc_destroy(&t->upc);
+	u_pc_fake_create(s->nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
+	COMP_WARN(ct->c,
+	          "Experimental DRM/KMS CPU readback target: GPU fence wait + page-flip wait; no zero-copy/low-latency "
+	          "claim.");
+	return true;
+}
+static bool
+target_init_post_vulkan(struct comp_target *ct, uint32_t width, uint32_t height)
+{
+	struct drm_kms_target *t = (void *)ct;
+	struct vk_bundle *vk = &ct->c->base.vk;
+	VkPhysicalDeviceProperties p;
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &p);
+	if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+		COMP_ERROR(ct->c, "DRM refuses CPU Vulkan device: %s", p.deviceName);
+		return false;
+	}
+	COMP_INFO(ct->c, "DRM Vulkan GPU: %s", p.deviceName);
+	t->has_init_vulkan = true;
+	return true;
+}
+static bool
+target_check_ready(struct comp_target *ct)
+{
+	struct drm_kms_target *t = (void *)ct;
+	return t->kms && !t->failed;
+}
+static bool
+target_is_shared_presentable_image(struct comp_target *ct)
+{
+	return false;
+}
+static void
+target_create_images(struct comp_target *ct,
+                     const struct comp_target_create_images_info *info,
+                     struct vk_bundle_queue *queue)
+{
+	struct drm_kms_target *t = (void *)ct;
+	struct vk_bundle *vk = &ct->c->base.vk;
+	if (t->readback[0])
+		return;
+	if (info->extent.width != comp_drm_kms_width(t->kms) || info->extent.height != comp_drm_kms_height(t->kms)) {
+		COMP_ERROR(ct->c, "DRM image extent must match selected physical mode");
+		t->failed = true;
+		return;
+	}
+	VkFormat format = VK_FORMAT_UNDEFINED;
+	for (uint32_t i = 0; i < info->format_count; i++)
+		if (info->formats[i] == VK_FORMAT_B8G8R8A8_UNORM || info->formats[i] == VK_FORMAT_B8G8R8A8_SRGB) {
+			format = info->formats[i];
+			break;
+		}
+	if (format == VK_FORMAT_UNDEFINED) {
+		COMP_ERROR(ct->c, "DRM readback requires requested BGRA8 format");
+		t->failed = true;
+		return;
+	}
+	for (unsigned i = 0; i < 2; i++) {
+		t->readback[i] =
+		    comp_drm_readback_create(vk->physical_device, vk->device, queue->family_index, info->extent.width,
+		                             info->extent.height, format, info->image_usage);
+		if (!t->readback[i]) {
+			t->failed = true;
+			return;
+		}
+		t->images[i].handle = comp_drm_readback_image(t->readback[i]);
+		t->images[i].view = comp_drm_readback_view(t->readback[i]);
+	}
+	VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	if (vk->vkCreateSemaphore(vk->device, &sem, NULL, &ct->semaphores.render_complete) != VK_SUCCESS) {
+		t->failed = true;
+		return;
+	}
+	ct->image_count = 2;
+	ct->images = t->images;
+	ct->format = format;
+	ct->width = info->extent.width;
+	ct->height = info->extent.height;
+	ct->final_layout = VK_IMAGE_LAYOUT_GENERAL;
+	ct->surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	ct->present_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+}
+static bool
+target_has_images(struct comp_target *ct)
+{
+	return ct->images != NULL;
+}
+static VkResult
+target_acquire(struct comp_target *ct, uint32_t *index)
+{
+	struct drm_kms_target *t = (void *)ct;
+	if (t->failed || !ct->images || t->index != -1)
+		return VK_ERROR_INITIALIZATION_FAILED;
+	*index = t->next;
+	t->index = t->next;
+	return VK_SUCCESS;
+}
+static VkResult
+target_present(struct comp_target *ct,
+               struct vk_bundle_queue *queue,
+               uint32_t index,
+               uint64_t value,
+               int64_t desired,
+               int64_t slop)
+{
+	struct drm_kms_target *t = (void *)ct;
+	if (t->failed || t->index != (int64_t)index || index >= 2)
+		return VK_ERROR_INITIALIZATION_FAILED;
+	/* Same queue family as rendering. The renderer signals this binary
+	 * semaphore once; this transfer submission consumes it once. */
+	if (queue != ct->c->base.vk.main_queue) {
+		t->failed = true;
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
+	const uint8_t *pixels = NULL;
+	vk_queue_lock(queue);
+	VkResult ret =
+	    comp_drm_readback_copy(t->readback[index], queue->queue, ct->semaphores.render_complete, false, &pixels);
+	vk_queue_unlock(queue);
+	if (ret != VK_SUCCESS || !comp_drm_kms_present(t->kms, pixels, ct->width * 4)) {
+		t->failed = true;
+		COMP_ERROR(ct->c, "DRM present failed VkResult=%d; no buffer reuse", ret);
+		return ret == VK_SUCCESS ? VK_ERROR_SURFACE_LOST_KHR : ret;
+	}
+	t->index = -1;
+	t->next ^= 1;
+	return VK_SUCCESS;
+}
+static VkResult
+target_wait_for_present(struct comp_target *ct, time_duration_ns timeout)
+{
+	return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+static void
+target_flush(struct comp_target *ct)
+{}
+static VkResult
+target_update_timings(struct comp_target *ct)
+{
+	return VK_SUCCESS;
+}
+static void
+target_set_title(struct comp_target *ct, const char *title)
+{}
+static VkResult
+target_queue_supports_present(struct comp_target *ct, struct vk_bundle_queue *queue, VkBool32 *supported)
+{
+	*supported = queue == ct->c->base.vk.main_queue;
+	return VK_SUCCESS;
+}
+static void
+target_destroy(struct comp_target *ct)
+{
+	struct drm_kms_target *t = (void *)ct;
+	struct vk_bundle *vk = &ct->c->base.vk;
+	comp_drm_kms_close(t->kms);
+	if (t->has_init_vulkan) {
+		vk->vkDeviceWaitIdle(vk->device);
+		for (unsigned i = 0; i < 2; i++)
+			comp_drm_readback_destroy(t->readback[i]);
+		if (ct->semaphores.render_complete)
+			vk->vkDestroySemaphore(vk->device, ct->semaphores.render_complete, NULL);
+	}
+	u_pc_destroy(&t->upc);
+	free(t);
+}
+static void
+target_calc_frame_pacing(struct comp_target *ct,
+                         int64_t *out_frame_id,
+                         int64_t *out_wake_up_time_ns,
+                         int64_t *out_desired_present_time_ns,
+                         int64_t *out_present_slop_ns,
+                         int64_t *out_predicted_display_time_ns)
+{
+	struct drm_kms_target *dit = (struct drm_kms_target *)ct;
+
+	int64_t frame_id = -1;
+	int64_t wake_up_time_ns = 0;
+	int64_t desired_present_time_ns = 0;
+	int64_t present_slop_ns = 0;
+	int64_t predicted_display_time_ns = 0;
+	int64_t predicted_display_period_ns = 0;
+	int64_t min_display_period_ns = 0;
+	int64_t now_ns = os_monotonic_get_ns();
+
+	u_pc_predict(dit->upc,                     //
+	             now_ns,                       //
+	             &frame_id,                    //
+	             &wake_up_time_ns,             //
+	             &desired_present_time_ns,     //
+	             &present_slop_ns,             //
+	             &predicted_display_time_ns,   //
+	             &predicted_display_period_ns, //
+	             &min_display_period_ns);      //
+
+	*out_frame_id = frame_id;
+	*out_wake_up_time_ns = wake_up_time_ns;
+	*out_desired_present_time_ns = desired_present_time_ns;
+	*out_predicted_display_time_ns = predicted_display_time_ns;
+	*out_present_slop_ns = present_slop_ns;
+}
+
+static void
+target_mark_timing_point(struct comp_target *ct, enum comp_target_timing_point point, int64_t frame_id, int64_t when_ns)
+{
+	struct drm_kms_target *dit = (struct drm_kms_target *)ct;
+
+	switch (point) {
+	case COMP_TARGET_TIMING_POINT_WAKE_UP:
+		u_pc_mark_point(dit->upc, U_TIMING_POINT_WAKE_UP, frame_id, when_ns);
+		break;
+	case COMP_TARGET_TIMING_POINT_BEGIN: //
+		u_pc_mark_point(dit->upc, U_TIMING_POINT_BEGIN, frame_id, when_ns);
+		break;
+	case COMP_TARGET_TIMING_POINT_SUBMIT_BEGIN:
+		u_pc_mark_point(dit->upc, U_TIMING_POINT_SUBMIT_BEGIN, frame_id, when_ns);
+		break;
+	case COMP_TARGET_TIMING_POINT_SUBMIT_END:
+		u_pc_mark_point(dit->upc, U_TIMING_POINT_SUBMIT_END, frame_id, when_ns);
+		break;
+	default: assert(false);
+	}
+}
+
+static void
+target_info_gpu(struct comp_target *ct, int64_t frame_id, int64_t gpu_start_ns, int64_t gpu_end_ns, int64_t when_ns)
+{
+	struct drm_kms_target *dit = (struct drm_kms_target *)ct;
+
+	u_pc_info_gpu(dit->upc, frame_id, gpu_start_ns, gpu_end_ns, when_ns);
+}
+
+
+static bool
+factory_detect(const struct comp_target_factory *f, struct comp_compositor *c)
+{
+	return false;
+}
+static bool
+factory_create(const struct comp_target_factory *f, struct comp_compositor *c, struct comp_target **out)
+{
+	struct drm_kms_target *t = calloc(1, sizeof(*t));
+	if (!t)
+		return false;
+	t->base = (struct comp_target){.name = "drm_kms",
+	                               .c = c,
+	                               .init_pre_vulkan = target_init_pre_vulkan,
+	                               .init_post_vulkan = target_init_post_vulkan,
+	                               .check_ready = target_check_ready,
+	                               .is_shared_presentable_image = target_is_shared_presentable_image,
+	                               .create_images = target_create_images,
+	                               .has_images = target_has_images,
+	                               .acquire = target_acquire,
+	                               .present = target_present,
+	                               .wait_for_present = target_wait_for_present,
+	                               .flush = target_flush,
+	                               .calc_frame_pacing = target_calc_frame_pacing,
+	                               .mark_timing_point = target_mark_timing_point,
+	                               .update_timings = target_update_timings,
+	                               .info_gpu = target_info_gpu,
+	                               .set_title = target_set_title,
+	                               .queue_supports_present = target_queue_supports_present,
+	                               .destroy = target_destroy};
+	t->index = -1;
+	u_pc_fake_create(c->settings.nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
+	*out = &t->base;
+	return true;
+}
+const struct comp_target_factory comp_target_factory_drm_kms = {
+    .name = "Native DRM/KMS (experimental CPU readback)",
+    .identifier = "drm_kms",
+    .requires_vulkan_for_create = false,
+    .is_deferred = false,
+    .detect = factory_detect,
+    .create_target = factory_create,
+};

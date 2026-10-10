@@ -53,3 +53,7 @@ if(XRT_FEATURE_SERVICE
 	)
 	add_subdirectory(sdl_test)
 endif()
+
+if(XRT_HAVE_DRM_KMS AND XRT_MODULE_COMPOSITOR_MAIN)
+	add_subdirectory(kms_probe)
+endif()
