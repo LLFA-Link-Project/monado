@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 #include "main/comp_window.h"
 #include "comp_drm_kms.h"
-#include "comp_drm_readback.h"
+#include "comp_drm_dma.h"
 #include "util/u_pacing.h"
 #include <stdlib.h>
 #include <string.h>
@@ -10,7 +10,8 @@ struct drm_kms_target
 {
 	struct comp_target base;
 	struct comp_drm_kms *kms;
-	struct comp_drm_readback *readback[2];
+	struct comp_drm_dma *dma[2];
+	uint64_t frames, gpu_wait_ns, flip_wait_ns;
 	struct comp_target_image images[2];
 	struct u_pacing_compositor *upc;
 	int64_t index;
@@ -52,7 +53,7 @@ target_init_pre_vulkan(struct comp_target *ct)
 	u_pc_destroy(&t->upc);
 	u_pc_fake_create(s->nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
 	COMP_WARN(ct->c,
-	          "Experimental DRM/KMS CPU readback target: GPU fence wait + page-flip wait; no zero-copy/low-latency "
+	          "DRM/KMS DMA-BUF direct scanout: no CPU pixel copy; GPU fence wait + page-flip wait; no low-latency "
 	          "claim.");
 	return true;
 }
@@ -89,7 +90,7 @@ target_create_images(struct comp_target *ct,
 {
 	struct drm_kms_target *t = (void *)ct;
 	struct vk_bundle *vk = &ct->c->base.vk;
-	if (t->readback[0])
+	if (t->dma[0])
 		return;
 	if (info->extent.width != comp_drm_kms_width(t->kms) || info->extent.height != comp_drm_kms_height(t->kms)) {
 		COMP_ERROR(ct->c, "DRM image extent must match selected physical mode");
@@ -103,20 +104,22 @@ target_create_images(struct comp_target *ct,
 			break;
 		}
 	if (format == VK_FORMAT_UNDEFINED) {
-		COMP_ERROR(ct->c, "DRM readback requires requested BGRA8 format");
+		COMP_ERROR(ct->c, "DRM DMA-BUF requires requested BGRA8 format");
 		t->failed = true;
 		return;
 	}
 	for (unsigned i = 0; i < 2; i++) {
-		t->readback[i] =
-		    comp_drm_readback_create(vk->physical_device, vk->device, queue->family_index, info->extent.width,
-		                             info->extent.height, format, info->image_usage);
-		if (!t->readback[i]) {
+		t->dma[i] = comp_drm_dma_create(vk->physical_device, vk->device, queue->family_index,
+		                                info->extent.width, info->extent.height, format, info->image_usage);
+		if (!t->dma[i] || !comp_drm_kms_import(t->kms, i, comp_drm_dma_fd(t->dma[i]),
+		                                       comp_drm_dma_pitch(t->dma[i]), comp_drm_dma_offset(t->dma[i]))) {
+			COMP_ERROR(ct->c,
+			           "DMA-BUF allocation/import failed; no CPU fallback. See usage/format/IOCTL logs.");
 			t->failed = true;
 			return;
 		}
-		t->images[i].handle = comp_drm_readback_image(t->readback[i]);
-		t->images[i].view = comp_drm_readback_view(t->readback[i]);
+		t->images[i].handle = comp_drm_dma_image(t->dma[i]);
+		t->images[i].view = comp_drm_dma_view(t->dma[i]);
 	}
 	VkSemaphoreCreateInfo sem = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 	if (vk->vkCreateSemaphore(vk->device, &sem, NULL, &ct->semaphores.render_complete) != VK_SUCCESS) {
@@ -143,6 +146,16 @@ target_acquire(struct comp_target *ct, uint32_t *index)
 	struct drm_kms_target *t = (void *)ct;
 	if (t->failed || !ct->images || t->index != -1)
 		return VK_ERROR_INITIALIZATION_FAILED;
+	struct vk_bundle_queue *queue = ct->c->base.vk.main_queue;
+	/* Synchronous previous flip has retired this image. Acquire FOREIGN ownership
+	 * before the renderer touches it, with the same externally locked queue. */
+	vk_queue_lock(queue);
+	VkResult ret = comp_drm_dma_acquire(t->dma[t->next], queue->queue);
+	vk_queue_unlock(queue);
+	if (ret != VK_SUCCESS) {
+		t->failed = true;
+		return ret;
+	}
 	*index = t->next;
 	t->index = t->next;
 	return VK_SUCCESS;
@@ -159,20 +172,29 @@ target_present(struct comp_target *ct,
 	if (t->failed || t->index != (int64_t)index || index >= 2)
 		return VK_ERROR_INITIALIZATION_FAILED;
 	/* Same queue family as rendering. The renderer signals this binary
-	 * semaphore once; this transfer submission consumes it once. */
+	 * semaphore once; the ownership-release submission consumes it once. */
 	if (queue != ct->c->base.vk.main_queue) {
 		t->failed = true;
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
-	const uint8_t *pixels = NULL;
+	int64_t begin = os_monotonic_get_ns();
 	vk_queue_lock(queue);
-	VkResult ret =
-	    comp_drm_readback_copy(t->readback[index], queue->queue, ct->semaphores.render_complete, false, &pixels);
+	VkResult ret = comp_drm_dma_release(t->dma[index], queue->queue, ct->semaphores.render_complete, false);
 	vk_queue_unlock(queue);
-	if (ret != VK_SUCCESS || !comp_drm_kms_present(t->kms, pixels, ct->width * 4)) {
+	int64_t ready = os_monotonic_get_ns();
+	if (ret != VK_SUCCESS || !comp_drm_kms_present_imported(t->kms, index)) {
 		t->failed = true;
 		COMP_ERROR(ct->c, "DRM present failed VkResult=%d; no buffer reuse", ret);
 		return ret == VK_SUCCESS ? VK_ERROR_SURFACE_LOST_KHR : ret;
+	}
+	t->gpu_wait_ns += ready - begin;
+	t->flip_wait_ns += os_monotonic_get_ns() - ready;
+	if (++t->frames % 120 == 0) {
+		COMP_INFO(
+		    ct->c,
+		    "DMA-BUF 120 frames: average release/GPU wait %.3f ms, KMS flip wait %.3f ms; CPU pixel copies=0",
+		    t->gpu_wait_ns / 120e6, t->flip_wait_ns / 120e6);
+		t->gpu_wait_ns = t->flip_wait_ns = 0;
 	}
 	t->index = -1;
 	t->next ^= 1;
@@ -209,7 +231,7 @@ target_destroy(struct comp_target *ct)
 	if (t->has_init_vulkan) {
 		vk->vkDeviceWaitIdle(vk->device);
 		for (unsigned i = 0; i < 2; i++)
-			comp_drm_readback_destroy(t->readback[i]);
+			comp_drm_dma_destroy(t->dma[i]);
 		if (ct->semaphores.render_complete)
 			vk->vkDestroySemaphore(vk->device, ct->semaphores.render_complete, NULL);
 	}
@@ -319,8 +341,9 @@ factory_create(const struct comp_target_factory *f, struct comp_compositor *c, s
 	return true;
 }
 const struct comp_target_factory comp_target_factory_drm_kms = {
-    .name = "Native DRM/KMS (experimental CPU readback)",
+    .name = "Native DRM/KMS (DMA-BUF direct scanout)",
     .identifier = "drm_kms",
+    .required_instance_version = VK_API_VERSION_1_1,
     .requires_vulkan_for_create = false,
     .is_deferred = false,
     .detect = factory_detect,

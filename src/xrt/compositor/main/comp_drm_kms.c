@@ -36,6 +36,11 @@ struct comp_drm_kms
 	struct saved_prop props[16];
 	unsigned count;
 	struct dumb buffers[2];
+	struct
+	{
+		uint32_t handle, fb;
+	} imported[2];
+	int scanout;
 	unsigned next;
 	bool changed, failed, flip_done;
 	uint32_t old_blob;
@@ -84,6 +89,7 @@ comp_drm_kms_open(const char *device, FILE *log)
 	if (!k)
 		return NULL;
 	k->fd = -1;
+	k->scanout = -1;
 	k->log = log;
 	glob_t paths = {0};
 	if (!device)
@@ -451,6 +457,8 @@ flip(int fd, unsigned sequence, unsigned sec, unsigned usec, void *data)
 	(void)usec;
 	*(bool *)data = true;
 }
+static bool
+present_fb(struct comp_drm_kms *k, uint32_t fb);
 bool
 comp_drm_kms_present(struct comp_drm_kms *k, const uint8_t *bgra, uint32_t stride)
 {
@@ -459,7 +467,15 @@ comp_drm_kms_present(struct comp_drm_kms *k, const uint8_t *bgra, uint32_t strid
 	struct dumb *d = &k->buffers[k->next];
 	for (unsigned y = 0; y < k->mode.vdisplay; y++)
 		memcpy((uint8_t *)d->map + y * d->pitch, bgra + (size_t)y * stride, (size_t)k->mode.hdisplay * 4);
-	drmModeAtomicReq *a = request(k, d->fb, false);
+	bool result = present_fb(k, d->fb);
+	if (result)
+		k->scanout = -1;
+	return result;
+}
+static bool
+present_fb(struct comp_drm_kms *k, uint32_t fb)
+{
+	drmModeAtomicReq *a = request(k, fb, false);
 	if (!a)
 		return false;
 	k->flip_done = false;
@@ -499,6 +515,47 @@ comp_drm_kms_present(struct comp_drm_kms *k, const uint8_t *bgra, uint32_t strid
 	k->next ^= 1;
 	return true;
 }
+bool
+comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pitch, uint32_t offset)
+{
+	if (index >= 2 || k->imported[index].handle || k->changed || pitch < (uint32_t)k->mode.hdisplay * 4)
+		return false;
+	if (drmPrimeFDToHandle(k->fd, fd, &k->imported[index].handle))
+		return error(k, "PRIME FD import");
+	uint32_t handles[4] = {k->imported[index].handle}, pitches[4] = {pitch}, offsets[4] = {offset};
+	uint64_t modifiers[4] = {DRM_FORMAT_MOD_LINEAR};
+	int ret =
+	    drmModeAddFB2WithModifiers(k->fd, k->mode.hdisplay, k->mode.vdisplay, DRM_FORMAT_XRGB8888, handles, pitches,
+	                               offsets, modifiers, &k->imported[index].fb, DRM_MODE_FB_MODIFIERS);
+	/* Some drivers accept implicit LINEAR but don't advertise it in IN_FORMATS.
+	 * The Vulkan modifier is queried, never inferred; actual TEST_ONLY is mandatory. */
+	if (ret && (errno == EINVAL || errno == EOPNOTSUPP))
+		ret = drmModeAddFB2(k->fd, k->mode.hdisplay, k->mode.vdisplay, DRM_FORMAT_XRGB8888, handles, pitches,
+		                    offsets, &k->imported[index].fb, 0);
+	if (ret)
+		return error(k, "DMA-BUF AddFB2 LINEAR");
+	drmModeAtomicReq *a = request(k, k->imported[index].fb, false);
+	if (!a)
+		return false;
+	ret = drmModeAtomicCommit(k->fd, a, DRM_MODE_ATOMIC_TEST_ONLY | DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+	drmModeAtomicFree(a);
+	if (ret)
+		return error(k, "DMA-BUF atomic TEST_ONLY");
+	fprintf(k->log, "DMA-BUF FB[%u]=%u handle=%u pitch=%u offset=%u XRGB8888/LINEAR TEST_ONLY passed\n", index,
+	        k->imported[index].fb, k->imported[index].handle, pitch, offset);
+	return true;
+}
+bool
+comp_drm_kms_present_imported(struct comp_drm_kms *k, unsigned index)
+{
+	if (k->failed || !k->plane || index >= 2 || k->scanout == (int)index || !k->imported[index].fb)
+		return false;
+	uint32_t fb = k->imported[index].fb;
+	if (!present_fb(k, fb))
+		return false;
+	k->scanout = (int)index;
+	return true;
+}
 void
 comp_drm_kms_close(struct comp_drm_kms *k)
 {
@@ -512,8 +569,13 @@ comp_drm_kms_close(struct comp_drm_kms *k)
 			fprintf(k->log, "Previous atomic KMS state restored\n");
 		drmModeAtomicFree(a);
 	}
-	for (unsigned i = 0; i < 2; i++)
+	for (unsigned i = 0; i < 2; i++) {
+		if (k->imported[i].fb)
+			drmModeRmFB(k->fd, k->imported[i].fb);
+		if (k->imported[i].handle)
+			drmCloseBufferHandle(k->fd, k->imported[i].handle);
 		free_dumb(k, &k->buffers[i]);
+	}
 	if (k->old_blob)
 		drmModeDestroyPropertyBlob(k->fd, k->old_blob);
 	if (k->blob)

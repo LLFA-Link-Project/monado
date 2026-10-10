@@ -26,3 +26,10 @@ uint32_t
 comp_drm_kms_height(struct comp_drm_kms *k);
 uint64_t
 comp_drm_kms_period_ns(struct comp_drm_kms *k);
+
+/* Import one single-plane LINEAR BGRA allocation. The caller retains the FD;
+ * KMS owns its GEM/FB references until close. TEST_ONLY precedes every import's use. */
+bool
+comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pitch, uint32_t offset);
+bool
+comp_drm_kms_present_imported(struct comp_drm_kms *k, unsigned index);

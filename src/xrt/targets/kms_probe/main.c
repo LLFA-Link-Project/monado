@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "comp_drm_kms.h"
 #include "comp_drm_readback.h"
+#include "comp_drm_dma.h"
 #include <errno.h>
 #include <signal.h>
 #include <limits.h>
@@ -24,10 +25,14 @@ usage(void)
 	    "  --connector NAME --mode WIDTHxHEIGHT@HZ [--plane ID] --test-only\n"
 	    "  --connector NAME --mode WIDTHxHEIGHT@HZ --show [--seconds N]\n"
 	    "  --vulkan-list\n"
+	    "  --dma-buf-check --gpu INDEX (64x64 export/ownership only, no KMS)\n"
+	    "  --connector NAME --mode WIDTHxHEIGHT@HZ --dma-buf-test-only [--gpu INDEX]\n"
+	    "  --connector NAME --mode WIDTHxHEIGHT@HZ --dma-buf-show [--gpu INDEX] [--seconds N]\n"
 	    "  --vulkan-readback-test --gpu INDEX (no KMS; CPU allowed for this test only)\n"
 	    "  --connector NAME --mode WIDTHxHEIGHT@HZ --vulkan-show [--gpu INDEX] [--seconds N]\n"
 	    "Mode refresh must match --list (three decimal places). Default: enumeration only.\n"
-	    "Only --show and --vulkan-show apply modesets. CPU Vulkan devices are rejected for display.");
+	    "Only --show, --vulkan-show and --dma-buf-show apply modesets. CPU Vulkan devices are rejected for "
+	    "display.");
 }
 static void
 modifier_queries(VkPhysicalDevice physical)
@@ -81,11 +86,12 @@ number(const char *s, unsigned long limit, unsigned long *value)
 	return !errno && end && !*end && *value <= limit;
 }
 static int
-vulkan(struct comp_drm_kms *k, int selected, bool show)
+vulkan(struct comp_drm_kms *k, int selected, bool show, bool dma, bool test_only, int seconds)
 {
 	VkInstance instance = VK_NULL_HANDLE;
 	VkDevice device = VK_NULL_HANDLE;
 	struct comp_drm_readback *r = NULL;
+	struct comp_drm_dma *ds[2] = {0};
 	int result = 1;
 	VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 	                         .pApplicationName = "monado-kms-probe",
@@ -94,6 +100,8 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 	VkResult ret = vkCreateInstance(&ic, NULL, &instance);
 	if (ret) {
 		fprintf(stderr, "vkCreateInstance: %d\n", ret);
+		if (dma)
+			comp_drm_kms_close(k);
 		return 1;
 	}
 	uint32_t count = 0;
@@ -122,7 +130,8 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 			if (!strcmp(es[j].extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME))
 				dma_buf = true;
 			if (strstr(es[j].extensionName, "external_memory") ||
-			    strstr(es[j].extensionName, "drm_format_modifier"))
+			    strstr(es[j].extensionName, "drm_format_modifier") ||
+			    strstr(es[j].extensionName, "queue_family_foreign"))
 				printf("  device extension: %s\n", es[j].extensionName);
 		}
 		if (modifiers && dma_buf)
@@ -149,7 +158,8 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 		fprintf(stderr, "Refusing CPU Vulkan device for physical display test\n");
 		goto end;
 	}
-	printf("Selected GPU: %s; sharing=CPU readback (no dma-buf export claimed)\n", prop.deviceName);
+	printf("Selected GPU: %s; sharing=%s\n", prop.deviceName,
+	       dma ? "DMA-BUF direct scanout (no CPU pixel copy)" : "CPU readback diagnostic");
 	uint32_t n = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, NULL);
 	VkQueueFamilyProperties *qs = calloc(n, sizeof(*qs));
@@ -172,6 +182,33 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 	                             .pQueuePriorities = &priority};
 	VkDeviceCreateInfo dc = {
 	    .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &q};
+	const char *extensions[] = {
+	    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+	    VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME};
+	if (dma) {
+		uint32_t ext_count = 0;
+		vkEnumerateDeviceExtensionProperties(physical, NULL, &ext_count, NULL);
+		VkExtensionProperties *exts = calloc(ext_count, sizeof(*exts));
+		if (!exts)
+			goto end;
+		vkEnumerateDeviceExtensionProperties(physical, NULL, &ext_count, exts);
+		bool supported = true;
+		for (unsigned e = 0; e < 4; e++) {
+			bool found = false;
+			for (uint32_t j = 0; j < ext_count; j++)
+				if (!strcmp(extensions[e], exts[j].extensionName))
+					found = true;
+			if (!found) {
+				fprintf(stderr, "DMA-BUF required device extension missing: %s\n", extensions[e]);
+				supported = false;
+			}
+		}
+		free(exts);
+		if (!supported)
+			goto end;
+		dc.enabledExtensionCount = 4;
+		dc.ppEnabledExtensionNames = extensions;
+	}
 	ret = vkCreateDevice(physical, &dc, NULL, &device);
 	if (ret) {
 		fprintf(stderr, "vkCreateDevice: %d\n", ret);
@@ -179,6 +216,48 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 	}
 	VkQueue queue;
 	vkGetDeviceQueue(device, family, 0, &queue);
+	if (dma) {
+		uint32_t w = k ? comp_drm_kms_width(k) : 64, h = k ? comp_drm_kms_height(k) : 64;
+		for (unsigned i = 0; i < 2; i++) {
+			ds[i] = comp_drm_dma_create(physical, device, family, w, h, VK_FORMAT_B8G8R8A8_UNORM,
+			                            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+			if (!ds[i] ||
+			    (k && !comp_drm_kms_import(k, i, comp_drm_dma_fd(ds[i]), comp_drm_dma_pitch(ds[i]),
+			                               comp_drm_dma_offset(ds[i]))))
+				goto end;
+		}
+		if (test_only) {
+			result = 0;
+			goto end;
+		}
+		struct timespec begin, now;
+		clock_gettime(CLOCK_MONOTONIC, &begin);
+		unsigned frames = 0;
+		double gpu_ms = 0, flip_ms = 0, elapsed = 0;
+		do {
+			unsigned i = frames % 2;
+			ret = comp_drm_dma_acquire(ds[i], queue);
+			if (ret != VK_SUCCESS)
+				goto end;
+			struct timespec start, ready;
+			clock_gettime(CLOCK_MONOTONIC, &start);
+			ret = comp_drm_dma_release(ds[i], queue, VK_NULL_HANDLE, true);
+			clock_gettime(CLOCK_MONOTONIC, &ready);
+			if (ret != VK_SUCCESS || (k && !comp_drm_kms_present_imported(k, i)))
+				goto end;
+			clock_gettime(CLOCK_MONOTONIC, &now);
+			gpu_ms += (ready.tv_sec - start.tv_sec) * 1000.0 + (ready.tv_nsec - start.tv_nsec) / 1e6;
+			flip_ms += (now.tv_sec - ready.tv_sec) * 1000.0 + (now.tv_nsec - ready.tv_nsec) / 1e6;
+			elapsed = (now.tv_sec - begin.tv_sec) + (now.tv_nsec - begin.tv_nsec) / 1e9;
+			frames++;
+		} while (!stop && (k ? elapsed < seconds : frames < 4));
+		printf(
+		    "DMA-BUF frames=%u elapsed=%.3f s fps=%.3f average GPU release=%.3f ms flip=%.3f ms; CPU pixel "
+		    "copies=0\n",
+		    frames, elapsed, frames / elapsed, gpu_ms / frames, flip_ms / frames);
+		result = 0;
+		goto end;
+	}
 	r = comp_drm_readback_create(physical, device, family, (k ? comp_drm_kms_width(k) : 64),
 	                             (k ? comp_drm_kms_height(k) : 64), VK_FORMAT_B8G8R8A8_UNORM,
 	                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
@@ -224,6 +303,11 @@ vulkan(struct comp_drm_kms *k, int selected, bool show)
 			result = 0;
 	}
 end:
+	/* Restore and remove KMS FB references before freeing exported Vulkan memory. */
+	if (dma)
+		comp_drm_kms_close(k);
+	for (unsigned i = 0; i < 2; i++)
+		comp_drm_dma_destroy(ds[i]);
 	comp_drm_readback_destroy(r);
 	if (device)
 		vkDestroyDevice(device, NULL);
@@ -236,12 +320,25 @@ main(int argc, char **argv)
 	const char *device = NULL, *connector = NULL, *mode = NULL;
 	uint32_t plane = 0;
 	bool test = false, show = false, vs = false, vl = false, selftest = false;
+	bool dma_test = false, dma_show = false, dma_check = false;
 	int gpu = -1, seconds = 5;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (!strcmp(a, "--help")) {
 			usage();
 			return 0;
+		}
+		if (!strcmp(a, "--dma-buf-test-only")) {
+			dma_test = true;
+			continue;
+		}
+		if (!strcmp(a, "--dma-buf-show")) {
+			dma_show = true;
+			continue;
+		}
+		if (!strcmp(a, "--dma-buf-check")) {
+			dma_check = true;
+			continue;
 		}
 		if (!strcmp(a, "--list"))
 			continue;
@@ -294,13 +391,33 @@ main(int argc, char **argv)
 			return 2;
 		}
 	}
+	if ((dma_test + dma_show + dma_check + test + show + vs + vl + selftest) > 1)
+		return 2;
+	if (dma_check)
+		return vulkan(NULL, gpu, true, true, false, seconds);
+	if (dma_test || dma_show) {
+		if (!connector || !mode)
+			return 2;
+		struct comp_drm_kms *k = comp_drm_kms_open(device, stderr);
+		if (!k)
+			return 1;
+		if (!comp_drm_kms_prepare(k, connector, mode, plane)) {
+			comp_drm_kms_close(k);
+			return 1;
+		}
+		struct sigaction sa = {.sa_handler = interrupted};
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+		return vulkan(k, gpu, true, true, dma_test, seconds); /* owns k */
+	}
 	if (selftest) {
 		if (test || show || vs || vl)
 			return 2;
-		return vulkan(NULL, gpu, true);
+		return vulkan(NULL, gpu, true, false, false, seconds);
 	}
 	if (vl && !test && !show && !vs)
-		return vulkan(NULL, gpu, false);
+		return vulkan(NULL, gpu, false, false, false, seconds);
 	if ((test + show + vs) > 1 || (vl && (test || show || vs)) || seconds < 1 || seconds > 60 ||
 	    ((test || show || vs) && (!connector || !mode))) {
 		usage();
@@ -326,7 +443,7 @@ main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 	if (vs)
-		result = vulkan(k, gpu, true);
+		result = vulkan(k, gpu, true, false, false, seconds);
 	else {
 		uint32_t w = comp_drm_kms_width(k), h = comp_drm_kms_height(k);
 		uint32_t *pixels = calloc((size_t)w * h, 4);

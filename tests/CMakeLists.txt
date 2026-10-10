@@ -60,6 +60,10 @@ if(XRT_BUILD_DRIVER_ARPARA)
 	list(APPEND tests tests_arpara)
 endif()
 
+if(XRT_HAVE_DRM_KMS AND XRT_MODULE_COMPOSITOR_MAIN)
+	list(APPEND tests tests_drm_dma)
+endif()
+
 foreach(testname ${tests})
 	add_executable(${testname} ${testname}.cpp)
 	target_link_libraries(${testname} PRIVATE xrt-external-catch2)
@@ -178,4 +182,8 @@ endif()
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(tests_vk_queue_mutex PRIVATE aux_vk)
+endif()
+
+if(TARGET tests_drm_dma)
+	target_link_libraries(tests_drm_dma PRIVATE comp_drm_dma)
 endif()

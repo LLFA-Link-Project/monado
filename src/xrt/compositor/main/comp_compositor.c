@@ -732,6 +732,12 @@ compositor_init_vulkan(struct comp_compositor *c)
 		u_extension_list_builder_append(required_device_ext_builder, required_device_extensions[i]);
 	}
 
+	if (non_wsi) {
+		u_extension_list_builder_append(required_device_ext_builder, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+		u_extension_list_builder_append(required_device_ext_builder, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+		u_extension_list_builder_append(required_device_ext_builder, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+	}
+
 	for (size_t i = 0; i < ARRAY_SIZE(optional_device_extensions); i++) {
 		const char *ext = optional_device_extensions[i];
 		if (non_wsi && (strstr(ext, "present") || strstr(ext, "swapchain") || strstr(ext, "display_control") ||

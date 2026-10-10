@@ -6,21 +6,36 @@
 `drm_kms` factory は明示指定専用で、自動選択しません。
 VkDisplayKHR / VkSurfaceKHR / VkSwapchainKHR、X11、Wayland を使わず、peek window も生成しません。
 
-この変更では診断用 CPU コピー経路を実装しています。
+Monado の DRM ターゲットは DMA-BUF 直接 scanout を使用します。CPU readback は独立プローブの旧診断オプションだけに残り、サービスは自動フォールバックしません。
 
 ```
-Monado renderer -> BGRA8 optimal VkImage (GENERAL)
- -> transfer submission (render_complete binary semaphore を一度消費)
- -> staging buffer -> fence wait -> 非 coherent memory の invalidate
- -> XRGB8888 linear DRM dumb buffer（実際の pitch に沿って行コピー）
- -> atomic commit -> page-flip event 完了 -> 前の scanout buffer を再利用
+Monado renderer -> exportable BGRA8 LINEAR VkImage (GENERAL)
+ -> render_complete binary semaphore を消費
+ -> GPU queue から FOREIGN queue へ ownership release + GPU fence wait
+ -> DMA-BUF FD -> KMS GEM import -> XRGB8888 FB
+ -> atomic commit -> page-flip 完了 -> 前の scanout image を再利用
 ```
 
-Vulkan 画像と KMS buffer はそれぞれ 2 枚です。描画と転送は同一 queue/family を使用し、
-queue mutex で外部同期します。転送と page-flip の待ちは各約 3 秒を上限とし、
-失敗したフレーム以降は buffer を再利用しません。GPU 完了待ちと全画面 CPU 転送を含むため、
-ゼロコピー・低遅延実装ではありません。fake pacer の周期には選択した実 KMS refresh を使います。
-精密な vblank 時刻への pacing、desired-present-time scheduling、sync FD は未実装です。
+描画画像 2 枚をそのまま KMS に登録し、staging buffer、CPU pixel mapping、全画面コピーを省きます。
+Monado の通常の layer 合成/歪み描画は GPU 上で行います。GPU ドライバ内部の動作までゼロコピーと断定するものではありません。
+LINEAR の single-plane modifier と実 renderer usage（compute では STORAGE）の exportability を照会し、
+専用 Vulkan memory を割り当てます。offset/pitch は Vulkan の subresource layout から取得します。
+KMS は明示 LINEAR modifier で AddFB2 を試し、EINVAL/EOPNOTSUPP の場合のみ、同じ LINEAR allocation の implicit AddFB2 を試します。
+どちらも **実際の DMA-BUF framebuffer に対する atomic TEST_ONLY** を通過することが必要です。
+事前の KMS 準備で使用する dumb buffer は診断/plane 選択用であり、サービスのフレーム転送には使用しません。
+
+必要な device 拡張は `VK_KHR_external_memory_fd`、`VK_EXT_external_memory_dma_buf`、
+`VK_EXT_image_drm_format_modifier`、`VK_EXT_queue_family_foreign` です。
+FOREIGN は Vulkan GPU と異なる表示デバイス/ドライバに ownership を渡すために使います。
+[仕様](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_queue_family_foreign.html)に従い、
+対応がない場合に別の queue-family 定数で代用しません。
+
+GPU 完了を CPU fence wait で確認してから KMS に渡し、page-flip 完了後だけ再利用します。
+待機は約 3 秒を上限とし、失敗後は再利用を禁止します。queue は mutex で外部同期します。
+まずコピー除去の実証を優先した同期方式であり、非同期 pipeline、KMS IN_FENCE_FD/OUT_FENCE_PTR、
+精密な vblank pacing は後続課題です。60/90 Hz の安定駆動はまだ保証しません。
+120 フレームごとに release/GPU 待ちと KMS flip 待ちの平均 CPU 経過時間をログに出します。
+これにはアプリ側の描画や acquire 待ちを含まず、全体 FPS / motion-to-photon latency ではありません。
 
 ## Orange Pi 5 でのビルド
 
@@ -28,7 +43,9 @@ queue mutex で外部同期します。転送と page-flip の待ちは各約 3 
 
 ```bash
 git submodule update --init --recursive
-# libdrm と Vulkan の開発ヘッダー/ライブラリ、従来の Monado/Rust 依存が必要。
+# Debian/Armbian: 実行用 libdrm2 だけでは開発ファイルが不足します。
+sudo apt install libdrm-dev libvulkan-dev
+# 従来の Monado/Rust 依存も必要。
 cmake -S . -B build -DXRT_HAVE_DRM_KMS=ON
 cmake --build build --parallel 2
 ./build/src/xrt/targets/cli/monado-cli test
@@ -79,7 +96,8 @@ SSH セッションの tty だけではアクティブな seat の権限が付�
 DRM modifier と dma-buf 拡張がある GPU では、BGRA8 の modifier/plane count/format features、
 COLOR_ATTACHMENT | TRANSFER_SRC の dma-buf image format query と import/export feature bits を照会します。
 これは実際の export/import/scanout 成功を意味しません。
-modifier の KMS との共通集合によるゼロコピー接続はまだ実装していません。
+サービスの直接出力と新しい DMA-BUF プローブは LINEAR export/import を実装しています。
+以下の旧 `--vulkan-show` は CPU コピー診断のままです。
 
 ```bash
 ./build/src/xrt/targets/kms_probe/monado-kms-probe \
@@ -99,6 +117,37 @@ DRM なしの Vulkan 検証（ここだけ CPU GPU を許可）:
 ```
 
 64x64 の全画素検査と、GENERAL layout の再コピー、binary semaphore の反復 signal/wait を行います。
+
+## DMA-BUF の段階的な実機検証
+
+サービスと他の KMS テストを終了してから、まず export と ownership を DRM なしで検証します。
+`--dma-buf-check` は 64x64、STORAGE | TRANSFER_DST の画像 2 枚について 4 回の acquire/clear/release を行います。
+同じ GPU index の device 拡張を確認し、非対応なら具体的な拡張名とともに失敗します。
+
+```bash
+./build/src/xrt/targets/kms_probe/monado-kms-probe --dma-buf-check --gpu 0
+./build/src/xrt/targets/kms_probe/monado-kms-probe \
+  --device /dev/dri/card0 --connector DP-1 --mode 3840x1920@71.998 \
+  --dma-buf-test-only --gpu 0
+```
+
+TEST_ONLY が通ったら、実際に表示を変更する以下のテストで緑色の画像を確認します。
+GPU が描画した共有画像を交互に scanout し、平均 FPS / GPU release / flip 待ち時間を出します。
+これは単純な clear の試験で、hello_xr の FPS を示すものではありません。
+
+```bash
+./build/src/xrt/targets/kms_probe/monado-kms-probe \
+  --device /dev/dri/card0 --connector DP-1 --mode 3840x1920@71.998 \
+  --dma-buf-show --gpu 0 --seconds 30
+```
+
+通常終了 / SIGINT / SIGTERM では KMS 復元と FB/GEM 解放を行ってから Vulkan memory を解放します。
+CPU GPU は物理表示テストで拒否します。SIGKILL/電源断や master 喪失時の復元は保証できません。
+
+確認できたらサービスを従来の起動手順で実行します。追加の DMA-BUF 有効化変数は不要です。
+90 Hz のモードは提示された EDID の `3840x1920@90.001`、60 Hz の例は `2560x1440@59.999` です。
+3840x1920@60 は提示された EDID にありません。各モードは TEST_ONLY から確認してください。
+画面比率/FOV/レンズ校正はこの DMA-BUF 変更では確定しません。
 
 ## Phase C: Monado renderer と接続
 
@@ -127,19 +176,27 @@ HMD driver の仮値を実仕様として書き換えることなく、composito
 電源断に対する復元保証はありません。復元失敗時は明確なエラーを出します。
 異常時の外部監視による復元、seat lifecycle、長時間安定性は実機で追加検証が必要です。
 
-## この作業環境での検証範囲
+## 確認状態
 
-- x86_64 の既存 `build/`: 全体ビルド成功。
-- arpara 回帰 CTest: 3/3 成功。CLI は実機がないため Simulated HMD（従来の未接続挙動）。
-- SwiftShader: 64x64 readback 全画素と semaphore reuse の検証成功。PanVK の検証ではありません。
-- AArch64 GCC 14.3: 新規 3 module と変更した compositor/renderer/settings、probe の object compile 成功。
-  headless 用ヘッダー構成で確認。ARM ライブラリとの link / Orange Pi 実行は未検証です。
-- `/dev/dri` が存在しないため、DRM 列挙/TEST_ONLY/静止画/PanVK→KMS/OpenXR 表示は未検証。
-  probe は失敗理由を出して終了します。サービスは compositor 生成失敗を報告します。
-  既存の service mainloop が残る場合は SIGINT で終了します（今回も SIGINT で終了を確認）。
+ユーザーの Orange Pi 5 実機ログでは、従来の CPU コピー経路について以下を確認しています。
 
-Vulkan 初期化前の起動失敗で未初期化 queue mutex を破棄して abort する既存問題も修正し、
-GPU 不要の lifecycle 回帰テストを追加しています。arpara と合わせて CTest 4/4 成功。
+- rockchip card0 / DP-1 / connector 84 / CRTC 82 / plane 39。
+- 3840x1920@71.998、XRGB8888 LINEAR、dumb pitch=15360 の TEST_ONLY 成功。
+- 青/オレンジのチェック柄が物理 HMD に表示され、終了後の atomic state 復元に成功。
+- Mali-G610/PanVK の clear + CPU readback、hello_xr の物理表示成功（フレームレートにばらつきあり）。
+- BGRA8 LINEAR、COLOR_ATTACHMENT | TRANSFER_SRC の export/import query は成功。
+  STORAGE usage と FOREIGN 対応、実 DMA-BUF export/scanout の確認を代替するものではありません。
 
-詳細ログは作業ツリーの `build/kms-validation/` に保存します（Git 管理対象外）。
-FOV、IPD、レンズ歪み、IMU 軸/校正は従来の暫定状態を維持します。
+今回の DMA-BUF 変更のローカル検証:
+
+- 既存 x86_64 `build/` の全体ビルド成功。
+- arpara/Rust/queue mutex 回帰、および DMA-BUF ownership / FD cleanup / timeout の GPU-free fault injection を検証。
+- AArch64 GCC 14.3 で新しい DMA-BUF module と変更モジュールの object compile 成功。
+  今回の DMA-BUF 経路を ARM ライブラリへ link して実行したとは報告しません。
+- SwiftShader は DMA-BUF/modifier 拡張を持たず、明確な非対応エラーで停止。共有の成功とは扱いません。
+- ローカルに `/dev/dri` と HMD がなく、**新 DMA-BUF 経路の TEST_ONLY、物理表示、PanVK/hello_xr 性能は未検証**。
+  CLI の Simulated HMD は未接続時の既存挙動であり、arpara 回帰成功の証拠にはしません。
+
+ログは `build/kms-validation/dma-*.log` に保存します（Git 管理対象外）。
+残る課題は、実機での DMA-BUF 表示確認、LINEAR 非対応時の modifier 交渉拡張、非同期 fence/pacing、
+画面比率と光学校正です。arpara Rust/HID/IMU コードは変更していません。
