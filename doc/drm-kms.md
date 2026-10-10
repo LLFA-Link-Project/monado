@@ -454,3 +454,83 @@ release submit/export は全19窓の平均0.163 ms、前のflip drain/commitは5
 ユーザー権限・seat・OS設定は無断で変更せず、各変更の効果を確認してから次の候補へ進みます。
 
 このメモの追加ではソース変更・ビルド・テストの再実行は行っていません。
+
+## Mesa 26対応と3840×1920出力geometry（2026-10-10）
+
+Mesa更新後のユーザーログでは Mali-G610 MC4 / Vulkan 1.4.354 が選ばれ、
+3画像のDMA-BUF importとTEST_ONLY、sync FD初期化までは成功しました。
+その後 `comp_vulkan_formats_copy_to_info` が停止しており、OpenXR表示成功とは扱いません。
+
+Monadoが検査するVulkan swapchain format候補は19種類ですが、従来の配列上限は16でした。
+旧処理はassertionより先に配列へ書き込んでいました。上限を64に拡張し、
+書き込み前に上限を確認するよう修正しました。将来候補が64を超えた場合は、
+元の優先順で64種類まで公開し、省略数を警告します。実際の対応数は起動時に
+`Vulkan swapchain formats: supported=N advertised=M capacity=64` と記録します。
+新Mesa実機の対応数は従来ログからは確定できません（上限超過の17〜19種類が候補）。
+19種類すべて対応するケースはGPU不要の回帰テストで確認します。
+
+`xrt_compositor_info.formats`、target要求format配列、settings、OpenXRのfilter配列は
+同じ定数を使用しています。IPC compositor_get_infoの返信は構造体のsizeofで送受信されるため、
+構造体サイズの変更が両端に反映されます。IPC受信側とOpenXR列挙側にもcount検証を追加しました。
+**サービスとMonado OpenXRランタイム／クライアントライブラリを同じ版で全体再ビルドしてください。**
+古いサービスを終了し、更新したランタイムをhello_xrから使用します。
+`IPC_IGNORE_VERSION=1` で旧版との不一致を回避しないでください。
+
+arpara USB HIDドライバが報告する暫定SBS geometryを確認したうえで、DRM専用に
+3840×1920の出力profileを設定します。左viewportは(0,0,1920,1920)、右は
+(1920,0,1920,1920)です。最終合成画像とKMS framebufferは選択モードと同じ3840×1920で、
+中間画像・コピーを追加しません。refreshは選択モードから取得し、72/90 Hzで同じgeometryです。
+アプリ向け推奨画像サイズを決めるHMDの `views[].display` は変更しません。
+非DRMバックエンドと他HMDは従来のviewport計算を使用します。
+
+このprofileは、既存ドライバの2眼・等幅SBS・回転なしという配置を保つためのものです。
+資料には各眼2544×2544という別の記述がありますが、3840×1920モードの実際の眼順序を
+証明する情報は確認できませんでした。**物理左右配置、パネル本来の解像度、レンズ歪み、
+FOV、IPDの校正が確定したという意味ではありません。** hello_xrで各眼の表示位置と
+幾何学形状を実機確認してください。profileに一致しないgeometry／モードでは従来の
+比率チェックを維持し、暗黙にストレッチしません。
+
+再ビルドと実機テスト（通常ユーザー、既存のDRM master/seatアクセスを使用）:
+
+```sh
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
+./build/src/xrt/targets/cli/monado-cli test
+
+# ALLOW_STRETCHを外し、まず90 Hz。別試行では MODE を3840x1920@71.998に変更。
+env -u XRT_COMPOSITOR_DRM_ALLOW_STRETCH \
+  XRT_COMPOSITOR_DRM_SYNC_FD=1 \
+  XRT_COMPOSITOR_FORCE_DRM=1 \
+  XRT_COMPOSITOR_DRM_DEVICE=/dev/dri/card0 \
+  XRT_COMPOSITOR_DRM_CONNECTOR=DP-1 \
+  XRT_COMPOSITOR_DRM_MODE=3840x1920@90.001 \
+  XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
+  XRT_COMPOSITOR_LOG=info \
+  ./build/src/xrt/targets/service/monado-service \
+  2>&1 | tee -i /tmp/monado-drm-mesa26-90hz.log
+```
+
+別端末からこれまでのhello_xrを起動し、60秒以上測定してください。
+`DRM output geometry` と `DRM final render extent=3840x1920, framebuffer=3840x1920`
+を確認します。DMA-BUF BGRA8/XRGB8888 LINEAR、3画像、IN_FENCE_FD、CPU pixel copies=0、
+CPU release fence waits=0、終了時KMS復元も確認します。
+今回ownership transfer、FIFO、fence、scanout退役、atomic復元処理は変更していません。
+ローカル開発環境では実機表示、実機対応format数、72/90 Hzの更新率は未検証です。
+
+今回のローカル検証結果:
+
+- `cmake --build build --parallel 2`: 全体ビルド成功。変更したヘッダの依存先を含め再構築。
+- `ctest --test-dir build --output-on-failure`: 34/34成功（2.79秒）。追加format/geometry、
+  既存DMA-BUF、KMS fence、FIFO/timing、arpara fixedとRust protocolテストを含む。
+- format全19種類のテスト: 9 assertions成功。GPUの列挙実測ではなく、全候補対応時の境界回帰確認。
+- `monado-cli test`: 終了0。ただし開発機に実機HMDはなく、Simulated HMDの結果。
+  arpara実機のHID/IMU成功の証拠にはしない。
+- AArch64コンパイル: DRM/KMS、DMA-BUF、target、renderer、settings、compositor、
+  Vulkan format処理、IPC client、OpenXR sessionを含むCオブジェクトのコンパイル成功。
+  ARM向け全体リンク・実行は未検証。
+- `git diff --check`: 成功。
+
+ログは `build/kms-validation/mesa26-*.log` に保存しています（ビルド成果物なのでコミット対象外）。
+実機のconnector列挙・TEST_ONLY・静止画・PanVK→KMS・OpenXR表示について、
+以前のMesaでの成功記録は上記既存節を参照してください。今回の新MesaでのOpenXR表示と
+修正後のgeometry／同期／復元の実測は、ユーザー実機での次回検証待ちです。

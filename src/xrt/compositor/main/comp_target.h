@@ -140,6 +140,10 @@ struct comp_target
 	//! Current dimensions of the target.
 	uint32_t width, height;
 
+	//! Optional absolute output viewports; zero count uses the device's scaled viewports.
+	uint32_t output_viewport_count;
+	struct xrt_rect output_viewports[XRT_MAX_VIEWS];
+
 	//! The format that the renderpass targeting this target should use.
 	VkFormat format;
 

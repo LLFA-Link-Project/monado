@@ -143,6 +143,12 @@ get_info(struct xrt_compositor *xc, struct xrt_compositor_info *out_info)
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
 
 	xrt_result_t xret = ipc_call_compositor_get_info(icc->ipc_c, out_info);
+	if (xret == XRT_SUCCESS && out_info->format_count > XRT_MAX_SWAPCHAIN_FORMATS) {
+		IPC_ERROR(icc->ipc_c, "Invalid compositor format count %u (capacity %u)", out_info->format_count,
+		          XRT_MAX_SWAPCHAIN_FORMATS);
+		out_info->format_count = 0;
+		return XRT_ERROR_IPC_FAILURE;
+	}
 	IPC_CHK_ALWAYS_RET(icc->ipc_c, xret, "ipc_call_compositor_get_info");
 }
 

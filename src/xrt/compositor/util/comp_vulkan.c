@@ -480,19 +480,27 @@ comp_vulkan_formats_check(struct vk_bundle *vk, struct comp_vulkan_formats *form
 void
 comp_vulkan_formats_copy_to_info(const struct comp_vulkan_formats *formats, struct xrt_compositor_info *info)
 {
+	uint32_t supported_count = 0;
 	uint32_t format_count = 0;
 
 #define ADD_IF_SUPPORTED(FORMAT)                                                                                       \
 	if (formats->has_##FORMAT) {                                                                                   \
-		info->formats[format_count++] = VK_FORMAT_##FORMAT;                                                    \
+		supported_count++;                                                                                    \
+		if (format_count < XRT_MAX_SWAPCHAIN_FORMATS) {                                                        \
+			info->formats[format_count++] = VK_FORMAT_##FORMAT;                                            \
+		}                                                                                                    \
 	}
 
 	VK_CSCI_FORMATS(ADD_IF_SUPPORTED, ADD_IF_SUPPORTED, ADD_IF_SUPPORTED, ADD_IF_SUPPORTED)
 
 #undef ADD_IF_SUPPORTED
 
-	assert(format_count <= XRT_MAX_SWAPCHAIN_FORMATS);
 	info->format_count = format_count;
+	U_LOG_I("Vulkan swapchain formats: supported=%u advertised=%u capacity=%u", supported_count, format_count,
+	        XRT_MAX_SWAPCHAIN_FORMATS);
+	if (supported_count > format_count) {
+		U_LOG_W("Swapchain format capacity exceeded: omitted %u formats", supported_count - format_count);
+	}
 }
 
 void

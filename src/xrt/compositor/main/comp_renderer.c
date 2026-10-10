@@ -197,6 +197,15 @@ calc_viewport_data(struct comp_renderer *r,
 {
 	struct comp_compositor *c = r->c;
 
+	if (c->target->output_viewport_count == view_count && view_count > 0) {
+		for (uint32_t i = 0; i < view_count; ++i) {
+			const struct xrt_rect *v = &c->target->output_viewports[i];
+			out_viewport_data[i] = (struct render_viewport_data){
+			    .x = v->offset.w, .y = v->offset.h, .w = v->extent.w, .h = v->extent.h};
+		}
+		return;
+	}
+
 	bool pre_rotate = false;
 	if (r->c->target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
 	    r->c->target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {

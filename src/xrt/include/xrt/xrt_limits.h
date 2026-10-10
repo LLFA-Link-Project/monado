@@ -55,7 +55,7 @@
 /*!
  * Max formats supported by a compositor, artificial limit.
  */
-#define XRT_MAX_SWAPCHAIN_FORMATS 16
+#define XRT_MAX_SWAPCHAIN_FORMATS 64
 
 /*!
  * Max number of plane orientations that can be requested at a time.

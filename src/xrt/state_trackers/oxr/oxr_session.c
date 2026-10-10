@@ -394,6 +394,10 @@ oxr_session_enumerate_formats(struct oxr_logger *log,
 		return oxr_session_success_result(sess);
 	}
 
+	if (xc->info.format_count > XRT_MAX_SWAPCHAIN_FORMATS) {
+		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Compositor format count exceeds array capacity");
+	}
+
 	uint32_t filtered_count = 0;
 	int64_t filtered_formats[XRT_MAX_SWAPCHAIN_FORMATS];
 	for (uint32_t i = 0; i < xc->info.format_count; i++) {

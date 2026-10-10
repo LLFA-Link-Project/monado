@@ -4,6 +4,7 @@
 #include "comp_drm_kms.h"
 #include "comp_drm_dma.h"
 #include "comp_drm_pipeline.h"
+#include "comp_drm_geometry.h"
 #include "util/u_pacing.h"
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,14 @@ target_init_pre_vulkan(struct comp_target *ct)
 		return false;
 	uint32_t w = comp_drm_kms_width(t->kms), h = comp_drm_kms_height(t->kms);
 	struct comp_settings *s = &ct->c->settings;
-	if ((uint64_t)w * s->preferred.height != (uint64_t)h * s->preferred.width) {
+	bool output_profile = comp_drm_arpara_output_viewports(ct->c->xdev, w, h, ct->output_viewports);
+	if (output_profile) {
+		ct->output_viewport_count = 2;
+		COMP_INFO(ct->c, "DRM output geometry: %ux%u, left=(0,0,1920,1920) right=(1920,0,1920,1920); "
+		                   "application recommended extents unchanged", w, h);
+		COMP_WARN(ct->c, "arpara output profile preserves provisional driver SBS ordering; "
+		                   "physical eye ordering, panel native resolution and optical calibration unverified.");
+	} else if ((uint64_t)w * s->preferred.height != (uint64_t)h * s->preferred.width) {
 		const char *allow = getenv("XRT_COMPOSITOR_DRM_ALLOW_STRETCH");
 		if (!allow || strcmp(allow, "1")) {
 			COMP_ERROR(ct->c,
@@ -111,6 +119,11 @@ target_create_images(struct comp_target *ct,
 		t->failed = true;
 		return;
 	}
+	if (info->format_count > XRT_MAX_SWAPCHAIN_FORMATS) {
+		COMP_ERROR(ct->c, "DRM requested format count exceeds array capacity");
+		t->failed = true;
+		return;
+	}
 	VkFormat format = VK_FORMAT_UNDEFINED;
 	for (uint32_t i = 0; i < info->format_count; i++)
 		if (info->formats[i] == VK_FORMAT_B8G8R8A8_UNORM || info->formats[i] == VK_FORMAT_B8G8R8A8_SRGB) {
@@ -169,6 +182,9 @@ target_create_images(struct comp_target *ct,
 	ct->final_layout = VK_IMAGE_LAYOUT_GENERAL;
 	ct->surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	ct->present_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	COMP_INFO(ct->c, "DRM final render extent=%ux%u, framebuffer=%ux%u, output viewports=%u",
+	          ct->width, ct->height, comp_drm_kms_width(t->kms), comp_drm_kms_height(t->kms),
+	          ct->output_viewport_count);
 }
 static bool
 target_has_images(struct comp_target *ct)
