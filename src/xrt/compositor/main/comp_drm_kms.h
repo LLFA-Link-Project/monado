@@ -33,3 +33,14 @@ bool
 comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pitch, uint32_t offset);
 bool
 comp_drm_kms_present_imported(struct comp_drm_kms *k, unsigned index);
+
+/* At most one queued atomic commit; nonblocking pump returns true while pending.
+ * Only free slots may be rendered. Synchronous legacy probe API is retained. */
+bool
+comp_drm_kms_pump(struct comp_drm_kms *k, bool wait);
+bool
+comp_drm_kms_slot_free(struct comp_drm_kms *k, unsigned index);
+bool
+comp_drm_kms_queue_imported(struct comp_drm_kms *k, unsigned index);
+uint64_t
+comp_drm_kms_last_flip_ns(struct comp_drm_kms *k);

@@ -1278,7 +1278,7 @@ comp_renderer_draw(struct comp_renderer *r)
 		render_gfx_fini(&render_g);
 	}
 
-	if (present_success) {
+	if (present_success && !ct->defer_present_wait) {
 		renderer_wait_for_present(r, desired_present_time_ns);
 	}
 

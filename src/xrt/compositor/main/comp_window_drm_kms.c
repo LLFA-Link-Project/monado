@@ -3,6 +3,7 @@
 #include "main/comp_window.h"
 #include "comp_drm_kms.h"
 #include "comp_drm_dma.h"
+#include "comp_drm_pipeline.h"
 #include "util/u_pacing.h"
 #include <stdlib.h>
 #include <string.h>
@@ -10,11 +11,11 @@ struct drm_kms_target
 {
 	struct comp_target base;
 	struct comp_drm_kms *kms;
-	struct comp_drm_dma *dma[2];
+	struct comp_drm_dma *dma[COMP_DRM_IMAGES];
 	uint64_t frames, gpu_wait_ns, flip_wait_ns;
-	struct comp_target_image images[2];
+	struct comp_target_image images[COMP_DRM_IMAGES];
 	struct u_pacing_compositor *upc;
-	int64_t index;
+	int64_t index, wake_ns, budget_ns;
 	unsigned next;
 	bool has_init_vulkan, failed;
 };
@@ -53,7 +54,8 @@ target_init_pre_vulkan(struct comp_target *ct)
 	u_pc_destroy(&t->upc);
 	u_pc_fake_create(s->nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
 	COMP_WARN(ct->c,
-	          "DRM/KMS DMA-BUF direct scanout: no CPU pixel copy; GPU fence wait + page-flip wait; no low-latency "
+	          "DRM/KMS DMA-BUF direct scanout: no CPU pixel copy; GPU release fence wait + queued page-flip, 3 "
+	          "images; no low-latency "
 	          "claim.");
 	return true;
 }
@@ -108,7 +110,7 @@ target_create_images(struct comp_target *ct,
 		t->failed = true;
 		return;
 	}
-	for (unsigned i = 0; i < 2; i++) {
+	for (unsigned i = 0; i < COMP_DRM_IMAGES; i++) {
 		t->dma[i] = comp_drm_dma_create(vk->physical_device, vk->device, queue->family_index,
 		                                info->extent.width, info->extent.height, format, info->image_usage);
 		if (!t->dma[i] || !comp_drm_kms_import(t->kms, i, comp_drm_dma_fd(t->dma[i]),
@@ -126,7 +128,8 @@ target_create_images(struct comp_target *ct,
 		t->failed = true;
 		return;
 	}
-	ct->image_count = 2;
+	ct->image_count = COMP_DRM_IMAGES;
+	ct->defer_present_wait = true;
 	ct->images = t->images;
 	ct->format = format;
 	ct->width = info->extent.width;
@@ -146,8 +149,24 @@ target_acquire(struct comp_target *ct, uint32_t *index)
 	struct drm_kms_target *t = (void *)ct;
 	if (t->failed || !ct->images || t->index != -1)
 		return VK_ERROR_INITIALIZATION_FAILED;
+	if (!comp_drm_kms_pump(t->kms, false)) {
+		t->failed = true;
+		return VK_ERROR_SURFACE_LOST_KHR;
+	}
+	unsigned candidate;
+	for (candidate = 0; candidate < COMP_DRM_IMAGES; candidate++) {
+		unsigned slot = (t->next + candidate) % COMP_DRM_IMAGES;
+		if (comp_drm_kms_slot_free(t->kms, slot)) {
+			t->next = slot;
+			break;
+		}
+	}
+	if (candidate == COMP_DRM_IMAGES) {
+		t->failed = true;
+		return VK_ERROR_INITIALIZATION_FAILED;
+	}
 	struct vk_bundle_queue *queue = ct->c->base.vk.main_queue;
-	/* Synchronous previous flip has retired this image. Acquire FOREIGN ownership
+	/* This slot is neither scanning out nor queued. Acquire FOREIGN ownership
 	 * before the renderer touches it, with the same externally locked queue. */
 	vk_queue_lock(queue);
 	VkResult ret = comp_drm_dma_acquire(t->dma[t->next], queue->queue);
@@ -169,7 +188,7 @@ target_present(struct comp_target *ct,
                int64_t slop)
 {
 	struct drm_kms_target *t = (void *)ct;
-	if (t->failed || t->index != (int64_t)index || index >= 2)
+	if (t->failed || t->index != (int64_t)index || index >= COMP_DRM_IMAGES)
 		return VK_ERROR_INITIALIZATION_FAILED;
 	/* Same queue family as rendering. The renderer signals this binary
 	 * semaphore once; the ownership-release submission consumes it once. */
@@ -182,22 +201,26 @@ target_present(struct comp_target *ct,
 	VkResult ret = comp_drm_dma_release(t->dma[index], queue->queue, ct->semaphores.render_complete, false);
 	vk_queue_unlock(queue);
 	int64_t ready = os_monotonic_get_ns();
-	if (ret != VK_SUCCESS || !comp_drm_kms_present_imported(t->kms, index)) {
+	if (ret != VK_SUCCESS || !comp_drm_kms_queue_imported(t->kms, index)) {
 		t->failed = true;
 		COMP_ERROR(ct->c, "DRM present failed VkResult=%d; no buffer reuse", ret);
 		return ret == VK_SUCCESS ? VK_ERROR_SURFACE_LOST_KHR : ret;
 	}
+	int64_t sample = ready - t->wake_ns;
+	int64_t period = comp_drm_kms_period_ns(t->kms);
+	if (t->wake_ns && sample > 0 && sample < period * 4)
+		t->budget_ns = t->budget_ns ? (t->budget_ns * 7 + sample + 1000000) / 8 : sample + 1000000;
 	t->gpu_wait_ns += ready - begin;
 	t->flip_wait_ns += os_monotonic_get_ns() - ready;
 	if (++t->frames % 120 == 0) {
-		COMP_INFO(
-		    ct->c,
-		    "DMA-BUF 120 frames: average release/GPU wait %.3f ms, KMS flip wait %.3f ms; CPU pixel copies=0",
-		    t->gpu_wait_ns / 120e6, t->flip_wait_ns / 120e6);
+		COMP_INFO(ct->c,
+		          "DMA-BUF 120 frames: average release/GPU wait %.3f ms, previous flip drain/commit %.3f ms; "
+		          "CPU pixel copies=0, wake-to-ready budget=%.3f ms",
+		          t->gpu_wait_ns / 120e6, t->flip_wait_ns / 120e6, t->budget_ns / 1e6);
 		t->gpu_wait_ns = t->flip_wait_ns = 0;
 	}
 	t->index = -1;
-	t->next ^= 1;
+	t->next = (index + 1) % COMP_DRM_IMAGES;
 	return VK_SUCCESS;
 }
 static VkResult
@@ -211,6 +234,11 @@ target_flush(struct comp_target *ct)
 static VkResult
 target_update_timings(struct comp_target *ct)
 {
+	struct drm_kms_target *t = (void *)ct;
+	if (!comp_drm_kms_pump(t->kms, false)) {
+		t->failed = true;
+		return VK_ERROR_SURFACE_LOST_KHR;
+	}
 	return VK_SUCCESS;
 }
 static void
@@ -230,7 +258,7 @@ target_destroy(struct comp_target *ct)
 	comp_drm_kms_close(t->kms);
 	if (t->has_init_vulkan) {
 		vk->vkDeviceWaitIdle(vk->device);
-		for (unsigned i = 0; i < 2; i++)
+		for (unsigned i = 0; i < COMP_DRM_IMAGES; i++)
 			comp_drm_dma_destroy(t->dma[i]);
 		if (ct->semaphores.render_complete)
 			vk->vkDestroySemaphore(vk->device, ct->semaphores.render_complete, NULL);
@@ -267,6 +295,14 @@ target_calc_frame_pacing(struct comp_target *ct,
 	             &predicted_display_period_ns, //
 	             &min_display_period_ns);      //
 
+	int64_t period = comp_drm_kms_period_ns(dit->kms);
+	int64_t budget = dit->budget_ns ? dit->budget_ns : period;
+	int64_t offset = predicted_display_time_ns - desired_present_time_ns;
+	desired_present_time_ns = comp_drm_predict_present(now_ns, comp_drm_kms_last_flip_ns(dit->kms), period, budget);
+	/* FIFO/backpressure limits work to available scanout slots. Start immediately
+	 * instead of imposing an unrelated fake 3ms wake-up budget on a GPU-bound queue. */
+	wake_up_time_ns = now_ns;
+	predicted_display_time_ns = desired_present_time_ns + offset;
 	*out_frame_id = frame_id;
 	*out_wake_up_time_ns = wake_up_time_ns;
 	*out_desired_present_time_ns = desired_present_time_ns;
@@ -281,6 +317,7 @@ target_mark_timing_point(struct comp_target *ct, enum comp_target_timing_point p
 
 	switch (point) {
 	case COMP_TARGET_TIMING_POINT_WAKE_UP:
+		dit->wake_ns = when_ns;
 		u_pc_mark_point(dit->upc, U_TIMING_POINT_WAKE_UP, frame_id, when_ns);
 		break;
 	case COMP_TARGET_TIMING_POINT_BEGIN: //

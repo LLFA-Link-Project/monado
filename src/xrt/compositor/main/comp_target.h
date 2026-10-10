@@ -163,6 +163,10 @@ struct comp_target
 	//! Whether wait_for_present is supported by this comp_target.
 	bool wait_for_present_supported;
 
+	//! Backend owns queued-present recycling and acquire safety; do not force
+	//! renderer-side present waiting/acquisition after every submit.
+	bool defer_present_wait;
+
 	/*
 	 *
 	 * Vulkan functions.

@@ -26,6 +26,7 @@ comp_drm_dma_pitch(struct comp_drm_dma *d);
 uint32_t
 comp_drm_dma_offset(struct comp_drm_dma *d);
 /* Queue externally locked. Acquire only after the previous scanout has retired.
+ * Acquire submits a barrier without CPU waiting on the renderer queue.
  * Release consumes the renderer's binary semaphore and waits for GPU completion.
  * Optional clear is exclusively for the standalone diagnostic. */
 VkResult

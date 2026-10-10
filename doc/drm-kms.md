@@ -16,7 +16,7 @@ Monado renderer -> exportable BGRA8 LINEAR VkImage (GENERAL)
  -> atomic commit -> page-flip 完了 -> 前の scanout image を再利用
 ```
 
-描画画像 2 枚をそのまま KMS に登録し、staging buffer、CPU pixel mapping、全画面コピーを省きます。
+サービスは描画画像 3 枚をそのまま KMS に登録し、staging buffer、CPU pixel mapping、全画面コピーを省きます。
 Monado の通常の layer 合成/歪み描画は GPU 上で行います。GPU ドライバ内部の動作までゼロコピーと断定するものではありません。
 LINEAR の single-plane modifier と実 renderer usage（compute では STORAGE）の exportability を照会し、
 専用 Vulkan memory を割り当てます。offset/pitch は Vulkan の subresource layout から取得します。
@@ -30,11 +30,23 @@ FOREIGN は Vulkan GPU と異なる表示デバイス/ドライバに ownership 
 [仕様](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_queue_family_foreign.html)に従い、
 対応がない場合に別の queue-family 定数で代用しません。
 
-GPU 完了を CPU fence wait で確認してから KMS に渡し、page-flip 完了後だけ再利用します。
+acquire ownership barrier は renderer と同じ queue に非同期 submit し、CPU fence wait を行いません。
+acquire と release の command buffer は別にし、release fence 完了前に acquire command を再記録しません。
+GPU 完了を release fence の CPU wait で確認してから KMS に渡し、page-flip 完了後だけ再利用します。
+KMS commit は1件だけ pending にし、scanout / queued / free の3状態を区別します。
+次の acquire は free image だけを選びます。present 後の renderer の強制 acquire/wait は DRM で省き、
+前の page-flip 完了を次の present が確認するまで、次フレームの GPU 処理を進めます。
+独立プローブの従来の present API は同期動作を維持します。
 待機は約 3 秒を上限とし、失敗後は再利用を禁止します。queue は mutex で外部同期します。
-まずコピー除去の実証を優先した同期方式であり、非同期 pipeline、KMS IN_FENCE_FD/OUT_FENCE_PTR、
-精密な vblank pacing は後続課題です。60/90 Hz の安定駆動はまだ保証しません。
-120 フレームごとに release/GPU 待ちと KMS flip 待ちの平均 CPU 経過時間をログに出します。
+今回 GPU 処理と page-flip 待ちを重ねる FIFO pipeline を追加しました。
+KMS IN_FENCE_FD/OUT_FENCE_PTR による release fence の CPU wait 除去は後続課題です。
+予測表示時刻には直近の page-flip 位相と wake→GPU-ready の平滑化した実測予算（1 ms margin）を使います。
+GPU-bound の queue に fake pacer の固定3 ms予算による待機を加えず、wake は即時にし、FIFO backpressure で制御します。
+DRM_CAP_TIMESTAMP_MONOTONIC がある場合は KMS event timestamp を使い、ない場合はイベント受信時の
+CPU monotonic 時刻を使ってログに明示します。後者は通知遅延を含みます。
+光学的な present-to-photon offset は未校正です。60/90 Hz の安定駆動はまだ保証しません。
+120 フレームごとに release/queue 完了待ち、前の flip drain/commit の平均 CPU 経過時間と
+wake-to-ready の予算をログに出します。後者の flip 時間は現在の commit の完了待ちではありません。
 これにはアプリ側の描画や acquire 待ちを含まず、全体 FPS / motion-to-photon latency ではありません。
 
 ## Orange Pi 5 でのビルド
@@ -215,7 +227,7 @@ XRT_COMPOSITOR_DRM_MODE=3840x1920@90.001 \
 XRT_COMPOSITOR_DRM_ALLOW_STRETCH=1 \
 XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
 XRT_COMPOSITOR_LOG=info \
-./build/src/xrt/targets/service/monado-service 2>&1 | tee /tmp/monado-drm-90hz.log
+./build/src/xrt/targets/service/monado-service 2>&1 | tee -i /tmp/monado-drm-90hz.log
 ```
 
 別のターミナルで従来通り hello_xr を起動します。同じ場面・画質・GPU・姿勢で、起動直後の約5秒を除き、
@@ -247,3 +259,33 @@ KMS timestamp は kernel が報告する flip 時刻で、HMD の実発光時刻
 
 計測コードの回帰テストには、90 Hz相当のイベント列、1周期の更新抜け、sequence の32bit wrap、
 pause、時刻後退と sequence がない場合を含めています。
+
+## 転送ログの比較と FIFO pipeline 変更
+
+`/home/reina/ArparaOpiLog/monado-drm-72hz.log` と `monado-drm-90hz.log` 全体を解析しました。
+各集計窓の区間数が120で等しいため、全体の更新率は窓の FPS の調和平均で求めています。
+起動時の窓を含み、丸められたログ値からの概算です。窓のp95は平均していません。
+
+| モード | 窓数 | 対象区間数 | 対象時間（概算） | 更新率 | GPU release/queue wait平均 | flip wait平均 |
+|---|---:|---:|---:|---:|---:|---:|
+| 71.998 Hz | 6 | 720 | 20.03秒 | 35.95 FPS | 10.76 ms | 3.40 ms |
+| 90.001 Hz | 14 | 1680 | 48.59秒 | 34.58 FPS | 10.81 ms | 10.23 ms |
+
+72 Hz の後半はほぼ2周期ごとの更新、90 Hz は主に2〜3周期ごとの更新でした。
+転送ログの末尾には終了時の復元行がなく、今回のファイルだけでは終了時復元を確認できません。
+ログ保存には `tee -i` を使用すると、Ctrl-C 後もサービス終了処理の出力を保存できます。
+
+ソース調査では acquire の CPU fence wait、同期 page-flip 待ち、renderer の present 後の acquire、
+fake pacer の固定3 ms予算を確認しました。今回の変更は上記の3画像 FIFO pipeline と即時 wake です。
+画像の ownership release/acquire、render_complete binary semaphore の1回消費、KMS TEST_ONLY は維持します。
+停止時には pending flip を drain してから復元と FB/GEM 解放を行います。
+idle中に完了済みイベントを後から回収しても、通知を処理しただけで timeout と誤判定しないようにしています。
+
+ローカルでは全体ビルド、arpara/Rust、DMA-BUF ownership/timeout、非同期 acquire の待機数と別 command buffer、
+3画像の scanout/queued 保護、vblank位相と描画予算の予測テストが成功しています。
+AArch64 は変更モジュールの object compile まで確認しました。
+新 pipeline の実機 FPS・表示・終了時復元は **未検証** です。画面比率は今回変更していません。
+
+比較時は同じ hello_xr 設定で、上記コマンドの mode をまず `3840x1920@71.998`、保存先を
+`/tmp/monado-drm-pipeline-72hz.log` にして採取し、次に90 Hzで
+`/tmp/monado-drm-pipeline-90hz.log` を採取してください。`KMS scanout` の update_fps/p95/更新なし周期で比較します。

@@ -12,11 +12,11 @@ struct comp_drm_dma
 	VkImageView view;
 	VkDeviceMemory memory;
 	VkCommandPool pool;
-	VkCommandBuffer cmd;
+	VkCommandBuffer cmd[2];
 	VkFence fence;
 	uint32_t family, pitch, offset;
 	int fd;
-	bool initialized, external, pending;
+	bool initialized, external, pending, acquire_pending;
 };
 #define CHECK(call)                                                                                                    \
 	do {                                                                                                           \
@@ -166,8 +166,8 @@ comp_drm_dma_create(VkPhysicalDevice physical,
 	VkCommandBufferAllocateInfo cmd = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 	                                   .commandPool = d->pool,
 	                                   .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	                                   .commandBufferCount = 1};
-	CHECK(vkAllocateCommandBuffers(device, &cmd, &d->cmd));
+	                                   .commandBufferCount = 2};
+	CHECK(vkAllocateCommandBuffers(device, &cmd, d->cmd));
 	VkFenceCreateInfo fence = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 	CHECK(vkCreateFence(device, &fence, NULL, &d->fence));
 	fprintf(stderr, "DMA-BUF export succeeded: pitch=%u offset=%u; no staging buffer or CPU pixel copy\n", d->pitch,
@@ -182,11 +182,13 @@ ownership(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool release,
 {
 	if (d->pending || (release ? (!d->initialized || d->external) : (d->initialized && !d->external)))
 		return VK_ERROR_INITIALIZATION_FAILED;
-	CHECK(vkResetCommandBuffer(d->cmd, 0));
-	CHECK(vkResetFences(d->device, 1, &d->fence));
+	VkCommandBuffer cmd = d->cmd[release ? 1 : 0];
+	CHECK(vkResetCommandBuffer(cmd, 0));
+	if (release)
+		CHECK(vkResetFences(d->device, 1, &d->fence));
 	VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 	                                  .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-	CHECK(vkBeginCommandBuffer(d->cmd, &begin));
+	CHECK(vkBeginCommandBuffer(cmd, &begin));
 	VkImageMemoryBarrier barrier = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .oldLayout = d->initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
@@ -203,25 +205,35 @@ ownership(struct comp_drm_dma *d, VkQueue queue, VkSemaphore wait, bool release,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
 	if (clear) {
 		VkClearColorValue color = {.float32 = {0.0f, 0.7f, 0.2f, 1.0f}};
-		vkCmdClearColorImage(d->cmd, d->image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &barrier.subresourceRange);
+		vkCmdClearColorImage(cmd, d->image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &barrier.subresourceRange);
 	}
-	vkCmdPipelineBarrier(d->cmd, release ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	vkCmdPipelineBarrier(cmd, release ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                     release ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
 	                     NULL, 0, NULL, 1, &barrier);
-	CHECK(vkEndCommandBuffer(d->cmd));
+	CHECK(vkEndCommandBuffer(cmd));
 	VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 	VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	                       .waitSemaphoreCount = wait ? 1 : 0,
 	                       .pWaitSemaphores = &wait,
 	                       .pWaitDstStageMask = &stage,
 	                       .commandBufferCount = 1,
-	                       .pCommandBuffers = &d->cmd};
-	CHECK(vkQueueSubmit(queue, 1, &submit, d->fence));
+	                       .pCommandBuffers = &cmd};
+	CHECK(vkQueueSubmit(queue, 1, &submit, release ? d->fence : VK_NULL_HANDLE));
+	if (!release) {
+		/* Renderer uses this same queue: the acquire barrier precedes its work.
+		 * Separate command buffers avoid resetting an in-flight acquire command.
+		 * The later release fence covers acquire + renderer + release. */
+		d->acquire_pending = true;
+		d->initialized = true;
+		d->external = false;
+		return VK_SUCCESS;
+	}
 	d->pending = true;
 	VkResult ret = vkWaitForFences(d->device, 1, &d->fence, VK_TRUE, UINT64_C(3000000000));
 	if (ret != VK_SUCCESS)
 		return ret; /* Never reset/reuse in-flight commands. */
 	d->pending = false;
+	d->acquire_pending = false;
 	d->initialized = true;
 	d->external = release;
 	return VK_SUCCESS;
@@ -268,7 +280,7 @@ comp_drm_dma_destroy(struct comp_drm_dma *d)
 {
 	if (!d)
 		return;
-	if (d->pending)
+	if (d->pending || d->acquire_pending)
 		vkDeviceWaitIdle(d->device);
 	if (d->fd >= 0)
 		close(d->fd);

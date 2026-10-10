@@ -3,6 +3,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "comp_drm_kms.h"
 #include "comp_drm_timing.h"
+#include "comp_drm_pipeline.h"
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
@@ -40,8 +41,10 @@ struct comp_drm_kms
 	struct
 	{
 		uint32_t handle, fb;
-	} imported[2];
-	int scanout;
+	} imported[COMP_DRM_IMAGES];
+	struct comp_drm_slots slots;
+	uint64_t last_flip_ns, pending_since_ns;
+	bool timestamp_monotonic;
 	unsigned next;
 	bool changed, failed, flip_done;
 	struct comp_drm_timing timing;
@@ -91,7 +94,8 @@ comp_drm_kms_open(const char *device, FILE *log)
 	if (!k)
 		return NULL;
 	k->fd = -1;
-	k->scanout = -1;
+	k->slots = (struct comp_drm_slots){-1, -1};
+	k->flip_done = true;
 	k->log = log;
 	glob_t paths = {0};
 	if (!device)
@@ -117,6 +121,10 @@ comp_drm_kms_open(const char *device, FILE *log)
 		drmVersionPtr v = drmGetVersion(fd);
 		fprintf(log, "KMS device=%s driver=%s master=%d\n", path, v ? v->name : "unknown", drmIsMaster(fd));
 		drmFreeVersion(v);
+		uint64_t monotonic = 0;
+		k->timestamp_monotonic = !drmGetCap(fd, DRM_CAP_TIMESTAMP_MONOTONIC, &monotonic) && monotonic;
+		fprintf(log, "KMS event timestamp clock: %s\n",
+		        k->timestamp_monotonic ? "monotonic" : "unverified (pacing uses event receipt)");
 		break;
 	}
 	globfree(&paths);
@@ -456,7 +464,12 @@ flip(int fd, unsigned sequence, unsigned sec, unsigned usec, void *data)
 	(void)fd;
 	struct comp_drm_kms *k = data;
 	k->flip_done = true;
+	k->slots.scanout = k->slots.queued;
+	k->slots.queued = -1;
 	uint64_t timestamp = (uint64_t)sec * UINT64_C(1000000000) + (uint64_t)usec * 1000;
+	struct timespec receipt;
+	clock_gettime(CLOCK_MONOTONIC, &receipt);
+	k->last_flip_ns = k->timestamp_monotonic ? timestamp : (uint64_t)receipt.tv_sec * 1000000000 + receipt.tv_nsec;
 	struct comp_drm_timing *t = &k->timing;
 	if (!comp_drm_timing_add(t, timestamp, sequence))
 		return;
@@ -485,12 +498,14 @@ comp_drm_kms_present(struct comp_drm_kms *k, const uint8_t *bgra, uint32_t strid
 		memcpy((uint8_t *)d->map + y * d->pitch, bgra + (size_t)y * stride, (size_t)k->mode.hdisplay * 4);
 	bool result = present_fb(k, d->fb);
 	if (result)
-		k->scanout = -1;
+		k->slots.scanout = -1;
 	return result;
 }
 static bool
-present_fb(struct comp_drm_kms *k, uint32_t fb)
+queue_fb(struct comp_drm_kms *k, uint32_t fb, int index)
 {
+	if (!comp_drm_kms_pump(k, true))
+		return false;
 	drmModeAtomicReq *a = request(k, fb, false);
 	if (!a)
 		return false;
@@ -503,13 +518,24 @@ present_fb(struct comp_drm_kms *k, uint32_t fb)
 		return error(k, "atomic present");
 	}
 	k->changed = true;
+	k->slots.queued = index;
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	k->pending_since_ns = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+	return true;
+}
+bool
+comp_drm_kms_pump(struct comp_drm_kms *k, bool wait)
+{
+	if (k->failed)
+		return false;
+	int ret;
 	drmEventContext ev = {.version = 2, .page_flip_handler = flip};
 	/* Timeout prevents indefinite waits on unplug/master loss. No buffer reuse after failure. */
-	struct timespec start, now;
-	clock_gettime(CLOCK_MONOTONIC, &start);
+	struct timespec now;
 	while (!k->flip_done) {
 		struct pollfd p = {.fd = k->fd, .events = POLLIN};
-		ret = poll(&p, 1, 100);
+		ret = poll(&p, 1, wait ? 100 : 0);
 		if (ret < 0 && errno == EINTR)
 			continue;
 		if (ret < 0 || (ret > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL)))) {
@@ -520,20 +546,32 @@ present_fb(struct comp_drm_kms *k, uint32_t fb)
 			k->failed = true;
 			return error(k, "page flip event");
 		}
+		if (k->flip_done)
+			break; /* A completed event may have waited through an idle session. */
 		clock_gettime(CLOCK_MONOTONIC, &now);
-		if (now.tv_sec - start.tv_sec >= 3) {
+		if ((uint64_t)now.tv_sec * 1000000000 + now.tv_nsec - k->pending_since_ns >= UINT64_C(3000000000)) {
 			fprintf(k->log, "Page flip timeout; refusing buffer reuse\n");
 			k->failed = true;
 			return false;
 		}
+		if (!wait)
+			break;
 	}
+	return true;
+}
+static bool
+present_fb(struct comp_drm_kms *k, uint32_t fb)
+{
+	if (!queue_fb(k, fb, -1) || !comp_drm_kms_pump(k, true))
+		return false;
 	k->next ^= 1;
 	return true;
 }
 bool
 comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pitch, uint32_t offset)
 {
-	if (index >= 2 || k->imported[index].handle || k->changed || pitch < (uint32_t)k->mode.hdisplay * 4)
+	if (index >= COMP_DRM_IMAGES || k->imported[index].handle || k->changed ||
+	    pitch < (uint32_t)k->mode.hdisplay * 4)
 		return false;
 	if (drmPrimeFDToHandle(k->fd, fd, &k->imported[index].handle))
 		return error(k, "PRIME FD import");
@@ -561,15 +599,26 @@ comp_drm_kms_import(struct comp_drm_kms *k, unsigned index, int fd, uint32_t pit
 	return true;
 }
 bool
+comp_drm_kms_slot_free(struct comp_drm_kms *k, unsigned index)
+{
+	return !k->failed && comp_drm_slot_free(&k->slots, index);
+}
+bool
+comp_drm_kms_queue_imported(struct comp_drm_kms *k, unsigned index)
+{
+	if (!comp_drm_kms_pump(k, true) || !k->plane || !comp_drm_kms_slot_free(k, index) || !k->imported[index].fb)
+		return false;
+	return queue_fb(k, k->imported[index].fb, index);
+}
+bool
 comp_drm_kms_present_imported(struct comp_drm_kms *k, unsigned index)
 {
-	if (k->failed || !k->plane || index >= 2 || k->scanout == (int)index || !k->imported[index].fb)
-		return false;
-	uint32_t fb = k->imported[index].fb;
-	if (!present_fb(k, fb))
-		return false;
-	k->scanout = (int)index;
-	return true;
+	return comp_drm_kms_queue_imported(k, index) && comp_drm_kms_pump(k, true);
+}
+uint64_t
+comp_drm_kms_last_flip_ns(struct comp_drm_kms *k)
+{
+	return k->last_flip_ns;
 }
 void
 comp_drm_kms_close(struct comp_drm_kms *k)
@@ -577,6 +626,7 @@ comp_drm_kms_close(struct comp_drm_kms *k)
 	if (!k)
 		return;
 	if (k->changed) {
+		comp_drm_kms_pump(k, true);
 		drmModeAtomicReq *a = request(k, 0, true);
 		if (!a || drmModeAtomicCommit(k->fd, a, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL))
 			error(k, "RESTORE FAILED (check local VT display state)");
@@ -584,12 +634,13 @@ comp_drm_kms_close(struct comp_drm_kms *k)
 			fprintf(k->log, "Previous atomic KMS state restored\n");
 		drmModeAtomicFree(a);
 	}
-	for (unsigned i = 0; i < 2; i++) {
+	for (unsigned i = 0; i < COMP_DRM_IMAGES; i++) {
 		if (k->imported[i].fb)
 			drmModeRmFB(k->fd, k->imported[i].fb);
 		if (k->imported[i].handle)
 			drmCloseBufferHandle(k->fd, k->imported[i].handle);
-		free_dumb(k, &k->buffers[i]);
+		if (i < 2)
+			free_dumb(k, &k->buffers[i]);
 	}
 	if (k->old_blob)
 		drmModeDestroyPropertyBlob(k->fd, k->old_blob);

@@ -13,7 +13,8 @@ extern "C" {
 static VkImageMemoryBarrier last_barrier;
 static VkSemaphore waited;
 static VkResult wait_result;
-static unsigned resets, destroyed, idle;
+static unsigned resets, destroyed, idle, fence_waits;
+static VkCommandBuffer reset_cmd;
 static int exported_fd;
 static bool exportable;
 template <typename T>
@@ -95,7 +96,8 @@ vkCreateCommandPool(VkDevice, const VkCommandPoolCreateInfo *, const VkAllocatio
 VKAPI_ATTR VkResult VKAPI_CALL
 vkAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo *, VkCommandBuffer *out)
 {
-	*out = handle<VkCommandBuffer>();
+	out[0] = handle<VkCommandBuffer>();
+	out[1] = (VkCommandBuffer)(uintptr_t)2;
 	return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -105,9 +107,10 @@ vkCreateFence(VkDevice, const VkFenceCreateInfo *, const VkAllocationCallbacks *
 	return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
-vkResetCommandBuffer(VkCommandBuffer, VkCommandBufferResetFlags)
+vkResetCommandBuffer(VkCommandBuffer cmd, VkCommandBufferResetFlags)
 {
 	resets++;
+	reset_cmd = cmd;
 	return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -154,6 +157,7 @@ VKAPI_ATTR VkResult VKAPI_CALL
 vkWaitForFences(VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t timeout)
 {
 	REQUIRE(timeout == 3000000000);
+	fence_waits++;
 	return wait_result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -205,7 +209,7 @@ create()
 {
 	wait_result = VK_SUCCESS;
 	exportable = true;
-	resets = destroyed = idle = 0;
+	resets = destroyed = idle = fence_waits = 0;
 	return comp_drm_dma_create(handle<VkPhysicalDevice>(), handle<VkDevice>(), 3, 64, 64, VK_FORMAT_B8G8R8A8_UNORM,
 	                           VK_IMAGE_USAGE_STORAGE_BIT);
 }
@@ -216,9 +220,13 @@ TEST_CASE("DMA-BUF ownership handoff and FD cleanup", "[drm][dma]")
 	REQUIRE(comp_drm_dma_pitch(d) == 256);
 	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_SUCCESS);
 	REQUIRE(last_barrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+	REQUIRE(fence_waits == 0);
+	REQUIRE(reset_cmd == handle<VkCommandBuffer>());
 	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
 	REQUIRE(comp_drm_dma_release(d, handle<VkQueue>(), handle<VkSemaphore>(), false) == VK_SUCCESS);
 	REQUIRE(waited == handle<VkSemaphore>());
+	REQUIRE(fence_waits == 1);
+	REQUIRE(reset_cmd == (VkCommandBuffer)(uintptr_t)2);
 	REQUIRE(last_barrier.srcQueueFamilyIndex == 3);
 	REQUIRE(last_barrier.dstQueueFamilyIndex == VK_QUEUE_FAMILY_FOREIGN_EXT);
 	REQUIRE(comp_drm_dma_release(d, handle<VkQueue>(), VK_NULL_HANDLE, false) != VK_SUCCESS);
@@ -233,8 +241,9 @@ TEST_CASE("DMA-BUF GPU timeout prohibits command and buffer reuse", "[drm][dma]"
 {
 	auto *d = create();
 	REQUIRE(d);
+	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_SUCCESS);
 	wait_result = VK_TIMEOUT;
-	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) == VK_TIMEOUT);
+	REQUIRE(comp_drm_dma_release(d, handle<VkQueue>(), VK_NULL_HANDLE, false) == VK_TIMEOUT);
 	auto old_resets = resets;
 	REQUIRE(comp_drm_dma_acquire(d, handle<VkQueue>()) != VK_SUCCESS);
 	REQUIRE(resets == old_resets);

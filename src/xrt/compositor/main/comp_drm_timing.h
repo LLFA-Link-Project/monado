@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 #define COMP_DRM_TIMING_SAMPLES 120
 struct comp_drm_timing
 {
@@ -17,8 +18,10 @@ static inline bool
 comp_drm_timing_add(struct comp_drm_timing *s, uint64_t ns, uint32_t sequence)
 {
 	if (!s->have_last || ns <= s->last_ns || ns - s->last_ns > UINT64_C(1000000000)) {
-		*s = (struct comp_drm_timing){
-		    .last_ns = ns, .last_sequence = sequence, .have_last = true, .sequence_valid = true};
+		memset(s, 0, sizeof(*s));
+		s->last_ns = ns;
+		s->last_sequence = sequence;
+		s->have_last = s->sequence_valid = true;
 		return false;
 	}
 	uint64_t interval = ns - s->last_ns;
