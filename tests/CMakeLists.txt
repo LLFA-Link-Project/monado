@@ -58,7 +58,7 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 endif()
 
 if(XRT_BUILD_DRIVER_ARPARA)
-	list(APPEND tests tests_arpara tests_arpara_optics)
+	list(APPEND tests tests_arpara tests_arpara_optics tests_llfa)
 endif()
 
 if(XRT_HAVE_DRM_KMS AND XRT_MODULE_COMPOSITOR_MAIN)
@@ -154,6 +154,11 @@ if(XRT_HAVE_VULKAN AND XRT_HAVE_D3D12)
 endif()
 
 if(XRT_BUILD_DRIVER_ARPARA)
+	target_link_libraries(tests_llfa PRIVATE target_lists drv_multi aux_math drv_includes)
+	target_include_directories(tests_llfa PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	    ${PROJECT_SOURCE_DIR}/src/xrt/targets/helpers)
+	add_test(NAME tests_llfa_enabled COMMAND ${CMAKE_COMMAND} -E env LLFA_TRACKER_OVERRIDE=1
+	    ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:tests_llfa>)
 	target_link_libraries(tests_arpara_optics PRIVATE drv_arpara drv_includes aux_math)
 	target_compile_definitions(tests_arpara_optics PRIVATE ARPARA_OPTICS_FIXTURE="${PROJECT_SOURCE_DIR}/src/xrt/drivers/arpara/calibration/optics.json")
 	target_link_libraries(tests_arpara PRIVATE drv_arpara drv_includes aux_os target_lists)
@@ -197,4 +202,16 @@ if(TARGET tests_drm_dma)
 	target_sources(tests_drm_kms_fence PRIVATE drm_kms_fence_fixture.c)
 	target_link_libraries(tests_drm_kms_fence PRIVATE PkgConfig::LIBDRM)
 	target_link_libraries(tests_drm_timing PRIVATE comp_drm_kms)
+endif()
+
+if(XRT_BUILD_DRIVER_SURVIVE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	add_executable(tests_survive_llfa tests_survive_llfa.cpp)
+	target_link_libraries(tests_survive_llfa PRIVATE xrt-external-catch2 drv_survive drv_includes
+	    aux_os aux_util PkgConfig::SURVIVE)
+	foreach(_symbol init start_thread close get_object_count get_first_object get_next_object
+	    object_get_type object_name json_config next_event wait_for_event)
+		target_link_options(tests_survive_llfa PRIVATE "LINKER:--wrap=survive_simple_${_symbol}")
+	endforeach()
+	target_link_options(tests_survive_llfa PRIVATE "LINKER:--wrap=pthread_mutex_init")
+	add_test(NAME tests_survive_llfa COMMAND tests_survive_llfa)
 endif()

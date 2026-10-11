@@ -300,4 +300,5 @@ endif()
 
 if(XRT_BUILD_DRIVER_ARPARA)
 	target_link_libraries(target_lists PRIVATE drv_arpara)
+	target_sources(target_lists PRIVATE target_builder_llfa.c target_llfa.c)
 endif()

@@ -37,6 +37,7 @@
 #include "vive/vive_poses.h"
 
 #include "survive_internal.h"
+#include "survive_llfa.h"
 #include "survive_vp2.h"
 
 
@@ -71,10 +72,12 @@ survive_device_destroy(struct xrt_device *xdev)
 
 	U_LOG_D("destroying survive device");
 	struct survive_device *survive = (struct survive_device *)xdev;
+	if (survive->sys->lock_initialized) {
+		os_mutex_lock(&survive->sys->lock);
+	}
 
-	if (survive == survive->sys->hmd) {
-		survive_vp2_teardown(survive);
-		vive_config_teardown(&survive->hmd.config);
+	bool was_hmd = survive == survive->sys->hmd;
+	if (was_hmd) {
 		survive->sys->hmd = NULL;
 	}
 	for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
@@ -89,6 +92,13 @@ survive_device_destroy(struct xrt_device *xdev)
 			all_null = false;
 		}
 	}
+	if (survive->sys->lock_initialized) {
+		os_mutex_unlock(&survive->sys->lock);
+	}
+	if (was_hmd) {
+		survive_vp2_teardown(survive);
+		vive_config_teardown(&survive->hmd.config);
+	}
 
 	if (survive->sys->hmd == NULL && all_null) {
 		U_LOG_D("Tearing down libsurvive context");
@@ -97,10 +107,14 @@ survive_device_destroy(struct xrt_device *xdev)
 		u_var_remove_root(survive->sys);
 
 		// Destroy also stops the thread.
-		os_thread_helper_destroy(&survive->sys->event_thread);
+		if (survive->sys->event_thread.initialized) {
+			os_thread_helper_destroy(&survive->sys->event_thread);
+		}
 
 		// Now that the thread is not running we can destroy the lock.
-		os_mutex_destroy(&survive->sys->lock);
+		if (survive->sys->lock_initialized) {
+			os_mutex_destroy(&survive->sys->lock);
+		}
 
 		U_LOG_D("Stopped libsurvive event thread");
 
@@ -218,6 +232,7 @@ survive_device_get_tracked_pose(struct xrt_device *xdev,
                                 struct xrt_space_relation *out_relation)
 {
 	struct survive_device *survive = (struct survive_device *)xdev;
+	*out_relation = (struct xrt_space_relation){0};
 	if (!verify_device_name(survive, name)) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&survive->base, survive->sys->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
@@ -232,8 +247,11 @@ survive_device_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_pose pose_offset = XRT_POSE_IDENTITY;
 	vive_poses_get_pose_offset(survive->base.name, survive->base.device_type, name, &pose_offset);
 
-	struct xrt_space_relation space_relation;
-	m_relation_history_get(survive->relation_hist, at_timestamp_ns, &space_relation);
+	struct xrt_space_relation space_relation = {0};
+	if (m_relation_history_get(survive->relation_hist, at_timestamp_ns, &space_relation) ==
+	    M_RELATION_HISTORY_RESULT_INVALID) {
+		return XRT_SUCCESS;
+	}
 
 	struct xrt_relation_chain relation_chain = {0};
 	m_relation_chain_push_pose(&relation_chain, &pose_offset);
@@ -1195,6 +1213,42 @@ add_device(struct survive_system *ss, const struct SurviveSimpleConfigEvent *e)
 	enum SurviveSimpleObject_type type = survive_simple_object_get_type(sso);
 
 	char *conf_str = (char *)survive_simple_json_config(sso);
+	if (get_device_by_object(ss, sso) != NULL) {
+		return; // A repeated configuration event must not create a second owner for this object.
+	}
+	if (ss->devices_published) {
+		U_LOG_IFL_W(ss->log_level, "Late device config ignored: static device list published; restart to add tracker");
+		return;
+	}
+	int device_count = ss->hmd != NULL ? 1 : 0;
+	for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
+		device_count += ss->controllers[i] != NULL ? 1 : 0;
+	}
+	if (device_count >= XRT_MAX_DEVICES_PER_PROBE) {
+		U_LOG_IFL_W(ss->log_level, "Device output capacity reached; not creating an unowned device");
+		return;
+	}
+
+	if (ss->llfa_trackers_only && (type == SurviveSimpleObject_HMD || type == SurviveSimpleObject_OBJECT)) {
+		struct vive_controller_config config = {0};
+		if (survive_llfa_tracker_config(conf_str, ss->llfa_selected_serial,
+		                                config.firmware.device_serial_number,
+		                                sizeof(config.firmware.device_serial_number))) {
+			// libsurvive already calibrated and solved this object's IMU pose. No display/eye transform
+			// from its possibly HMD-shaped JSON is applied. Reuse the existing tracker history/pose path.
+			config.variant = CONTROLLER_TRACKER_TUNDRA;
+			snprintf(config.firmware.model_number, sizeof(config.firmware.model_number), "Tundra Tracker");
+			if (_create_controller_device(ss, sso, &config)) {
+				U_LOG_IFL_I(ss->log_level, "LLFA: created tracking-only object serial=%s (libsurvive type=%d)",
+				            config.firmware.device_serial_number, type);
+			}
+			return;
+		}
+		if (type == SurviveSimpleObject_HMD) {
+			U_LOG_IFL_W(ss->log_level, "LLFA: excluding unselected Lighthouse HMD from this arpara system");
+			return;
+		}
+	}
 
 	if (type == SurviveSimpleObject_HMD) {
 
@@ -1308,8 +1362,9 @@ run_event_thread(void *ptr)
 	return NULL;
 }
 
-int
-survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config)
+static int
+survive_get_devices_impl(struct xrt_prober *xp, struct xrt_device **out_xdevs,
+                         struct vive_config **out_vive_config, bool trackers_only, const char *selected_serial)
 {
 	SurviveSimpleContext *actx = NULL;
 #if 1
@@ -1334,6 +1389,20 @@ survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct
 	}
 
 	struct survive_system *ss = U_TYPED_CALLOC(struct survive_system);
+	if (ss == NULL) {
+		survive_simple_close(actx);
+		return 0;
+	}
+	ss->llfa_trackers_only = trackers_only;
+	if (selected_serial != NULL) {
+		if (strlen(selected_serial) >= sizeof(ss->llfa_selected_serial)) {
+			U_LOG_E("LLFA: tracker serial too long");
+			survive_simple_close(actx);
+			free(ss);
+			return 0;
+		}
+		snprintf(ss->llfa_selected_serial, sizeof(ss->llfa_selected_serial), "%s", selected_serial);
+	}
 
 	survive_simple_start_thread(actx);
 
@@ -1377,10 +1446,10 @@ survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct
 
 	for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
 
-		if (out_idx == XRT_MAX_DEVICES_PER_PROBE - 1) {
+		if (out_idx == XRT_MAX_DEVICES_PER_PROBE) {
 			U_LOG_IFL_W(ss->log_level, "Probed max of %d devices, ignoring further devices",
 			            XRT_MAX_DEVICES_PER_PROBE);
-			return out_idx;
+			break;
 		}
 
 		if (ss->controllers[i] != NULL) {
@@ -1388,30 +1457,55 @@ survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct
 		}
 	}
 
+	if (out_idx == 0) {
+		// No returned device could own this context (e.g. empty dongle or inaccessible tracker).
+		survive_simple_close(ss->ctx);
+		free(ss);
+		return 0;
+	}
+
 	// Mutex before thread.
 	int ret = os_mutex_init(&ss->lock);
 	if (ret != 0) {
 		U_LOG_IFL_E(ss->log_level, "Failed to init mutex!");
-		survive_device_destroy((struct xrt_device *)ss->hmd);
-		for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
-			survive_device_destroy((struct xrt_device *)ss->controllers[i]);
-		}
-		return 0;
+		goto fail_devices;
 	}
+	ss->lock_initialized = true;
+	ss->devices_published = true;
 
-	os_thread_helper_init(&ss->event_thread);
+	ret = os_thread_helper_init(&ss->event_thread);
+	if (ret != 0) {
+		U_LOG_IFL_E(ss->log_level, "Failed to init event thread!");
+		goto fail_devices;
+	}
 	ret = os_thread_helper_start(&ss->event_thread, run_event_thread, ss);
 	if (ret != 0) {
 		U_LOG_IFL_E(ss->log_level, "Failed to start event thread!");
-		survive_device_destroy((struct xrt_device *)ss->hmd);
-		for (int i = 0; i < MAX_TRACKED_DEVICE_COUNT; i++) {
-			survive_device_destroy((struct xrt_device *)ss->controllers[i]);
-		}
-		return 0;
+		goto fail_devices;
 	}
 
 	u_var_add_root(ss, "Survive system", true);
 	u_var_add_draggable_f32(ss, &ss->timecode_offset_ms, "Timecode offset(ms)");
 
 	return out_idx;
+
+fail_devices:
+	// The last destroy frees ss. Iterate the independent output array, never ss after that point.
+	for (int i = 0; i < out_idx; i++) {
+		xrt_device_destroy(&out_xdevs[i]);
+	}
+	return 0;
+}
+
+int
+survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config)
+{
+	return survive_get_devices_impl(xp, out_xdevs, out_vive_config, false, NULL);
+}
+
+int
+survive_get_tracker_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, const char *selected_serial)
+{
+	struct vive_config *unused = NULL;
+	return survive_get_devices_impl(xp, out_xdevs, &unused, true, selected_serial);
 }

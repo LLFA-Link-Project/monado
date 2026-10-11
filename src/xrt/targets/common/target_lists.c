@@ -128,6 +128,11 @@ xrt_builder_create_func_t target_builder_list[] = {
     t_builder_simulated_create,
 #endif // T_BUILDER_SIMULATED
 
+#ifdef XRT_BUILD_DRIVER_ARPARA
+    // First physical builder: opt-in and arpara USB presence are both required.
+    t_builder_llfa_create,
+#endif
+
 #ifdef XRT_BUILD_DRIVER_RIFT
     rift_builder_create,
 #endif // XRT_BUILD_DRIVER_RIFT

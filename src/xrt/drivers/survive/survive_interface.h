@@ -29,6 +29,11 @@ extern "C" {
 int
 survive_get_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, struct vive_config **out_vive_config);
 
+// LLFA-only: expose tracking devices, never an HMD. Output capacity is XRT_MAX_DEVICES_PER_PROBE.
+// A matching serial permits a formerly HMD-configured tracker to use the existing tracker pose path.
+int
+survive_get_tracker_devices(struct xrt_prober *xp, struct xrt_device **out_xdevs, const char *selected_serial);
+
 #ifdef __cplusplus
 }
 #endif

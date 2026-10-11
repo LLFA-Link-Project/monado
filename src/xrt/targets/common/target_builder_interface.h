@@ -86,6 +86,11 @@ struct xrt_builder *
 t_builder_legacy_create(void);
 #endif
 
+#ifdef XRT_BUILD_DRIVER_ARPARA
+struct xrt_builder *
+t_builder_llfa_create(void);
+#endif
+
 #ifdef T_BUILDER_STEAMVR
 /*!
  * Builder for SteamVR proprietary wrapper (vive, index, tundra trackers, etc.)

@@ -137,10 +137,14 @@ struct survive_system
 	struct survive_device *controllers[MAX_TRACKED_DEVICE_COUNT];
 	enum u_logging_level log_level;
 	struct xrt_prober *xp;
+	bool llfa_trackers_only;
+	char llfa_selected_serial[XRT_DEVICE_NAME_LEN];
 
 	float wait_timeout;
 	struct u_var_draggable_f32 timecode_offset_ms;
 
 	struct os_thread_helper event_thread;
 	struct os_mutex lock;
+	bool lock_initialized;
+	bool devices_published;
 };
