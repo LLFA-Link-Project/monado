@@ -9,6 +9,14 @@ spec.loader.exec_module(module)
 
 
 class AnalysisTest(unittest.TestCase):
+    def test_late_wake_jitter_is_not_gpu_or_display_time(self):
+        events = (("planned_wake", 10000000), ("wake", 10200000), ("pose_return", 10500000))
+        result = module.analyze([dict(event=e, frame_id=7, monotonic_ns=ns, value=0) for e, ns in events])
+        self.assertEqual(result["wake_minus_planned"]["p99_ms"], .2)
+        self.assertEqual(result["wake_to_pose_fetch"]["p50_ms"], .3)
+        self.assertIsNone(result["pose_fetch_to_flip"])
+        self.assertIsNone(result["gpu_duration"])
+
     def test_pre_frame_wait_is_separate_from_pose_and_gpu_latency(self):
         events = (("pre_frame_wait_begin", 1000000), ("pre_frame_wait_end", 11000000),
                   ("pose_return", 12000000), ("gpu_end", 14000000), ("flip", 25000000))

@@ -17,7 +17,7 @@ struct drm_kms_target
 	uint64_t frames, gpu_wait_ns, flip_wait_ns;
 	struct comp_target_image images[COMP_DRM_IMAGES];
 	struct u_pacing_compositor *upc;
-	int64_t index, wake_ns, budget_ns;
+	int64_t index, wake_ns, budget_ns, wake_budget_ns;
 	unsigned next;
 	bool has_init_vulkan, failed, sync_fd, pre_frame_wait;
 	FILE *trace;
@@ -98,6 +98,30 @@ target_init_pre_vulkan(struct comp_target *ct)
 	s->preferred.width = w;
 	s->preferred.height = h;
 	s->nominal_frame_interval_ns = comp_drm_kms_period_ns(t->kms);
+	const char *wake_budget = getenv("XRT_COMPOSITOR_DRM_WAKE_BUDGET_US");
+	if (wake_budget) {
+		/* Strict bounded decimal parsing: no signed, fractional or overflowed input. */
+		uint64_t us = 0;
+		bool valid = *wake_budget != '\0';
+		for (const char *p = wake_budget; valid && *p; p++) {
+			if (*p < '0' || *p > '9' || us > 100000) {
+				valid = false;
+				break;
+			}
+			us = us * 10 + (unsigned)(*p - '0');
+		}
+		if (!valid || (us && (!t->pre_frame_wait || us < 1000 ||
+		                     us >= (uint64_t)s->nominal_frame_interval_ns / 1000))) {
+			COMP_ERROR(ct->c, "DRM_WAKE_BUDGET_US must be 0, or >=1000 and below the mode period; "
+			           "nonzero requires DRM_PRE_FRAME_WAIT=1");
+			return false;
+		}
+		t->wake_budget_ns = us * 1000;
+	}
+	if (t->wake_budget_ns)
+		COMP_WARN(ct->c, "DRM late wake: %.3f ms before desired flip; fixed planning allowance, "
+		          "not measured GPU time; compare deadline misses against immediate wake",
+		          t->wake_budget_ns / 1e6);
 	u_pc_destroy(&t->upc);
 	u_pc_fake_create(s->nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
 	COMP_WARN(ct->c,
@@ -322,7 +346,9 @@ target_present(struct comp_target *ct,
 		          "CPU pixel copies=0; CPU release fence waits=%u; prediction budget=%.3f ms%s",
 		          t->sync_fd ? "release submit/export" : "release/GPU wait", t->gpu_wait_ns / 120e6,
 		          t->flip_wait_ns / 120e6, t->sync_fd ? 0 : 120,
-		          (t->pre_frame_wait ? period / 2 : (t->budget_ns ? t->budget_ns : period)) / 1e6,
+		          (t->wake_budget_ns ? t->wake_budget_ns :
+		           (t->pre_frame_wait ? period / 2 : (t->budget_ns ? t->budget_ns : period))) / 1e6,
+		          t->wake_budget_ns ? " (late wake allowance, not GPU time)" :
 		          t->pre_frame_wait ? " (pre-frame wait, half-period allowance, not GPU time)"
 		                            : (t->sync_fd ? " (fixed one-period estimate, not GPU time)" : " (wake-to-ready)"));
 		t->gpu_wait_ns = t->flip_wait_ns = 0;
@@ -406,9 +432,11 @@ target_calc_frame_pacing(struct comp_target *ct,
 	/* After retiring the previous flip, Graphics can target the next vblank.
 	 * This is a conservative planning allowance, not a GPU duration sample.
 	 * Late completion is still gated by IN_FENCE_FD and reported by the trace. */
-	int64_t budget = dit->pre_frame_wait ? period / 2 : (dit->budget_ns ? dit->budget_ns : period);
+	int64_t budget = dit->wake_budget_ns ? dit->wake_budget_ns :
+	                 (dit->pre_frame_wait ? period / 2 : (dit->budget_ns ? dit->budget_ns : period));
 	int64_t kms_present = comp_drm_predict_present(now_ns, comp_drm_kms_last_flip_ns(dit->kms), period, budget);
-	u_pc_fake_override_next_present(dit->upc, kms_present, now_ns);
+	int64_t kms_wake = comp_drm_predict_wake(now_ns, kms_present, dit->wake_budget_ns);
+	u_pc_fake_override_next_present(dit->upc, kms_present, kms_wake);
 
 	u_pc_predict(dit->upc,                     //
 	             now_ns,                       //
@@ -421,9 +449,8 @@ target_calc_frame_pacing(struct comp_target *ct,
 	             &min_display_period_ns);      //
 
 	int64_t offset = predicted_display_time_ns - desired_present_time_ns;
-	/* FIFO/backpressure limits work to available scanout slots. Start immediately
-	 * instead of imposing an unrelated fake 3ms wake-up budget on a GPU-bound queue. */
-	wake_up_time_ns = now_ns;
+	/* The multi compositor's existing wait_frame sleeps before layer selection
+	 * and pose fetch. No Vulkan/DRM lock is held during this optional late wake. */
 	predicted_display_time_ns = desired_present_time_ns + offset;
 	dit->prediction = (struct u_metrics_system_present_info){.frame_id = frame_id,
 	                                                         .when_predict_ns = now_ns,
@@ -432,6 +459,7 @@ target_calc_frame_pacing(struct comp_target *ct,
 	                                                         .predicted_display_time_ns = predicted_display_time_ns,
 	                                                         .present_slop_ns = present_slop_ns};
 	target_trace(ct, "predict", frame_id, now_ns, period);
+	target_trace(ct, "planned_wake", frame_id, wake_up_time_ns, dit->wake_budget_ns);
 	if (dit->pre_frame_wait) {
 		target_trace(ct, "pre_frame_wait_begin", frame_id, wait_begin_ns, 0);
 		target_trace(ct, "pre_frame_wait_end", frame_id, now_ns, dit->failed);

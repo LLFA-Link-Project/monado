@@ -23,6 +23,8 @@ def analyze(rows):
     for row in rows:
         frames[int(row["frame_id"])][row["event"]] = (int(row["monotonic_ns"]), int(row["value"]))
     pairs = {"pre_frame_wait": ("pre_frame_wait_begin", "pre_frame_wait_end"),
+             "wake_minus_planned": ("planned_wake", "wake"),
+             "wake_to_pose_fetch": ("wake", "pose_return"),
              "resource_wait": ("resource_wait_begin", "resource_wait_end"),
              "queue_idle_wait": ("queue_idle_begin", "queue_idle_end"),
              "submit_cpu": ("submit_begin", "submit_end"),

@@ -89,3 +89,22 @@ TEST_CASE("KMS pre-frame retirement predicts the next available vblank", "[drm][
 		REQUIRE(comp_drm_predict_present(phase, 0, period, period / 2) == phase + period);
 	}
 }
+
+TEST_CASE("KMS late wake preserves headroom and never schedules in the past", "[drm][pipeline]")
+{
+	const int64_t phase = 1000000000, period = 11110998, allowance = 6000000;
+	int64_t now = phase + 200000;
+	int64_t present = comp_drm_predict_present(now, phase, period, allowance);
+	REQUIRE(present == phase + period);
+	REQUIRE(comp_drm_predict_wake(now, present, allowance) == phase + period - allowance);
+	REQUIRE(present - comp_drm_predict_wake(now, present, allowance) == allowance);
+	// If an event is consumed too late, move the target to the next vblank
+	// rather than shrink the requested drawing allowance.
+	now = phase + 7000000;
+	present = comp_drm_predict_present(now, phase, period, allowance);
+	REQUIRE(present == phase + 2 * period);
+	REQUIRE(comp_drm_predict_wake(now, present, allowance) >= now);
+	REQUIRE(comp_drm_predict_wake(now, now + 1000000, allowance) == now);
+	REQUIRE(comp_drm_predict_wake(now, now - 1000000, allowance) == now);
+	REQUIRE(comp_drm_predict_wake(now, present, 0) == now);
+}

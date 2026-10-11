@@ -341,6 +341,105 @@ XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
 検証ログは `build/arpara-validation/pre-frame-{build,tests,cli}.log`。
 ARM64ビルド、PanVK/KMS実機表示、MTP・主観的追従感の改善は未検証。
 
+### 実機ログ19: pre-frame waitによる姿勢の新しさ改善
+
+`19/monado-pre-frame.log` と `19/drm-pre-frame.csv` を解析。
+Monado `a8c835a9c`、GRAPHICS queue、Mali-G610 MC4/API1.4.354、
+3840×1920@71.998、sync FD→IN_FENCE_FD、3画像、pre-frame wait有効を起動ログで確認。
+CPU pixel copy/CPU release fence wait=0、正常終了/KMS state復元あり。
+18と同じfast_path=1基準で開始/終了の空描画を除き、3694フレームを集計した。
+
+| 指標 | 18: 従来Graphics (2925 frames) | 19: pre-frame wait (3694 frames) |
+|---|---:|---:|
+| 更新fps | 71.999 | 71.979 |
+| GPU query duration p50/p95/p99 ms | 2.104/2.446/3.273 | 2.112/2.624/3.191 |
+| pose取得→flip p50/p95/p99 ms | 27.255/27.375/27.403 | 13.650/13.807/13.816 |
+| pose取得→flip最大 ms | 27.611 | 27.520 |
+| GPU完了→flip p50 ms | 24.811 | 11.214 |
+| present request→commit p50 ms | 13.168 | 0.120 |
+| submit済み・未flip最大フレーム数 | 2 | 1 |
+| flip間隔 p50/p95/p99/max ms | 13.889/13.892/13.899/13.929 | 13.889/13.893/13.901/27.779 |
+| 更新のないVBlank / desired超過>0.5ms | 0/0 | 1/1 |
+
+姿勢取得→flip中央値が13.605ms（49.9%）短縮し、ほぼ1周期分新しい姿勢を提示できた。
+GPU描画速度はほぼ同じで、present後の旧flip待ちがpose取得前へ移ったことと整合する。
+pre-frame待ち中央値10.861msはpose取得前であり、上の遅延に足し戻さない。
+queue idle待ちは0.108→2.346msへ増えたが、GPU完了までの待ちがこの位置へ移ったためで、
+pose取得→flip短縮を否定する追加遅延ではない。GPU時間との合算もしない。
+
+唯一の遅れはframe6（通常描画2フレーム目）。GPU query duration12.848ms、
+pose→GPU完了13.135msでVBlank付近となり、次のVBlankに提示された。
+ログの最初の120フレーム窓の後は未更新VBlankが0で72Hzを維持。
+開始直後のGPU負荷スパイクの原因は未特定であり、除外して最大値を小さく報告しない。
+画像破損/tearing/光学的妥当性はCSVでは判定できないが、ログには同期/commitエラーなし。
+
+ユーザーの「少し良くなった」という主観と測定したソフトウェア区間の改善は整合する。
+ただし絶対MTP、IMUサンプルからpose取得まで、アプリlayer自体の新しさ、HMD発光は未測定。
+この結果を絶対MTPが13.65msになったという意味にはしない。
+現時点ではGraphics/scale100/pre-frame wait有効の72Hz設定を比較基準として保持し、
+次は同じ設定のまま90.001Hzを別ログで検証する。さらに遅いwakeはその後の候補であり、
+残る約11msのGPU完了→flipを全て安全に削減できると約束しない。
+
+### 実機ログ20: 90Hz pre-frame wait
+
+Monado `a8c835a9c`、GRAPHICS、pre-frame wait有効、3840×1920最終出力を起動ログで確認。
+fast_path=1の4584フレーム: 更新90.002fps、更新のないVBlank0、未flip要求0、
+submit済み未表示最大1フレーム。pose取得→flipはp50/p95/p99/maxが
+10.858/10.958/10.993/22.007ms、GPU query durationは2.206/2.678/3.012/7.943ms。
+submit→GPU完了はp99 3.185ms。GPU完了→flip中央値8.400ms、
+present request→commit中央値0.124ms。flip間隔p50/p95/p99/maxは
+11.111/11.114/11.152/11.184ms。desired超過>0.5msは1回だが、
+VBlank sequenceに未更新はない。予測deadline超過と実際のscanout更新欠落を同一視しない。
+正常終了/KMS復元を確認、同期/commitエラーなし。実発光/絶対MTPは引き続き未測定。
+
+### 次の実験: late wake（実装済み、実機未検証）
+
+`XRT_COMPOSITOR_DRM_WAKE_BUDGET_US` を追加した。既定/0は即時wakeで20と同じ動作。
+非zeroにはPRE_FRAME_WAIT=1、Graphics、sync FDが必要。
+値は1000us以上かつ選択mode周期未満の整数とし、不正設定は明示的に失敗する。
+例の6000は「desired flipの6ms前にwake」の意味で、6msの追加待ちではない。
+
+pre-frame drain後にKMS位相からdesired flipを計画し、その6ms前をwakeとして返す。
+既存multi compositorの `wait_frame()` / `u_wait_until()` が実際に待つ。
+予測時刻は先にclientへ伝え、wake後にlayer選択・Timewarp pose取得を行う。
+Vulkan/DRM lockを保持したsleepや、GPU描画済み画像へのpose更新は行わない。
+待ちが遅れた場合は過去のwakeを返さず、予測時点で余裕不足なら次VBlankへ繰り越す。
+render完了の保証は引き続きsync FD/IN_FENCE_FDで行う。GPUが遅れた場合、
+描画途中の画像を表示して短縮したことにはせず、次のflipとdeadline超過を測定する。
+
+20ではsubmit→GPU完了p99が3.185msなので、まず6msのCPU/queue/GPU全体の
+固定計画余裕で比較する。最大8.060msの例もあるため全フレームのdeadlineを保証しない。
+adaptiveなGPU時間予測、固定4msのdisplay offset、IMU予測、Timewarpモデルは変更しない。
+狙いは姿勢取得→flip約10.9msを約6msへ縮めることだが、実機の結果で確認する。
+
+同じbinaryでWAKE_BUDGET_US=0/6000を比較する。各回hello_xrを再起動し、
+90.001Hz、scale100%、同じscene/動きで約60秒測定する。有効側:
+
+```bash
+cmake --build build --parallel 2
+XRT_COMPOSITOR_DRM_WAKE_BUDGET_US=6000 \
+XRT_COMPOSITOR_DRM_PRE_FRAME_WAIT=1 \
+XRT_COMPOSITOR_DRM_TRACE_FILE=/tmp/drm-late-wake.csv \
+XRT_COMPOSITOR_SCALE_PERCENTAGE=100 XRT_COMPOSITOR_COMPUTE=0 \
+XRT_TRACKING_ORIGIN_OFFSET_Y=1.6 XRT_COMPOSITOR_DRM_SYNC_FD=1 \
+XRT_COMPOSITOR_FORCE_DRM=1 XRT_COMPOSITOR_DRM_DEVICE=/dev/dri/card0 \
+XRT_COMPOSITOR_DRM_CONNECTOR=DP-1 XRT_COMPOSITOR_DRM_MODE=3840x1920@90.001 \
+XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
+./build/src/xrt/targets/service/monado-service 2>&1 | tee -i /tmp/monado-late-wake.log
+```
+
+CSVにはplanned_wakeを追加し、集計はwake_minus_planned（実際のwake遅れ）と
+wake_to_pose_fetchを分離する。予定wakeを実測wakeとして使わない。
+fps/未更新VBlank/desired誤差/pose→flipのp95/p99/maxを比較し、悪化時は
+WAKE_BUDGET_US=0へ戻す（PRE_FRAME_WAIT=1は維持）。CPU pixel copy/release fence待ち0、
+3画像の寿命、ownership transfer、光学補正、HID/IMUは変更していない。
+実機の画像破損・追従感・WiVRnでの回帰は別途確認する。
+
+late wake変更のホスト全体ビルド成功、CTest 36/36成功。
+deadline/wakeの境界ケースと予定wake・実測wake・pose取得の分離を自動テストで確認。
+検証ログは `build/arpara-validation/late-wake-build.log` と `late-wake-tests.log`。
+今回変更のARM64ビルド、PanVK/KMS実機表示・遅延改善は未検証。
+
 既存buildの全体ビルドとCTestを実行する。KMS fault injectionではcommitの成功/失敗、
 sync FD所有権、queued/scanout再利用防止に加え、observerのimage対応/monotonic判定を確認する。
 pacerテストは上書きした予測が1回だけ適用されることを確認する。

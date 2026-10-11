@@ -24,3 +24,12 @@ comp_drm_predict_present(int64_t now, int64_t phase, int64_t period, int64_t bud
 	int64_t steps = (deadline - phase + period - 1) / period;
 	return phase + steps * period;
 }
+/* Plan a later wake without promising time in the past. Zero preserves the
+ * immediate-wake baseline. The caller validates allowance against the mode. */
+static inline int64_t
+comp_drm_predict_wake(int64_t now, int64_t present, int64_t allowance)
+{
+	if (allowance <= 0 || present - now <= allowance)
+		return now;
+	return present - allowance;
+}
