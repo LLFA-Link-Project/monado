@@ -9,6 +9,15 @@ spec.loader.exec_module(module)
 
 
 class AnalysisTest(unittest.TestCase):
+    def test_pre_frame_wait_is_separate_from_pose_and_gpu_latency(self):
+        events = (("pre_frame_wait_begin", 1000000), ("pre_frame_wait_end", 11000000),
+                  ("pose_return", 12000000), ("gpu_end", 14000000), ("flip", 25000000))
+        result = module.analyze([dict(event=e, frame_id=2, monotonic_ns=ns, value=0) for e, ns in events])
+        self.assertEqual(result["pre_frame_wait"]["p50_ms"], 10)
+        self.assertEqual(result["pose_fetch_to_flip"]["p50_ms"], 13)
+        self.assertEqual(result["gpu_end_to_flip"]["p50_ms"], 11)
+        self.assertIsNone(result["gpu_duration"])
+
     def test_pose_clock_annotations_and_receipt_age(self):
         text = "arpara pose timing: requested_ns=3000000 receipt_ns=1000000 query_ns=2000000 fusion_ns=500000"
         result = module.analyze_pose(text)

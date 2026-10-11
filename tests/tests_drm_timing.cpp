@@ -74,3 +74,18 @@ TEST_CASE("KMS predictions use measured budget and vblank phase", "[drm][pipelin
 	REQUIRE(comp_drm_predict_present(phase + 5 * period, phase, period, 1000000) == phase + 6 * period);
 	REQUIRE(comp_drm_predict_present(phase, 0, period, period) == phase + period);
 }
+
+TEST_CASE("KMS pre-frame retirement predicts the next available vblank", "[drm][pipeline]")
+{
+	for (int64_t period : {INT64_C(13889347), INT64_C(11110998)}) {
+		const int64_t phase = 1000000000;
+		// Fast graphics starts after the pending flip retires, rather than
+		// rendering immediately after the previous commit with two flips ahead.
+		REQUIRE(comp_drm_predict_present(phase + 200000, phase, period, period / 2) == phase + period);
+		// A delayed event consumer must not promise a deadline without headroom.
+		REQUIRE(comp_drm_predict_present(phase + period * 3 / 4, phase, period, period / 2) ==
+		        phase + 2 * period);
+		// Without a phase observation startup remains conservative.
+		REQUIRE(comp_drm_predict_present(phase, 0, period, period / 2) == phase + period);
+	}
+}

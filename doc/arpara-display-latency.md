@@ -177,6 +177,170 @@ gyro座標系・角速度・時刻同期を検証した短時間予測を独立A
 
 ## 検証記録
 
+### 実機ログ15（hello_xr単体、設定変更なし）
+
+ユーザー確認: hello_xr単体で取得、描画設定の変更なし。
+`ArparaOpiLog/15/drm.csv` を再集計し、同梱summaryと一致した。
+CSVのperiod=13,889,347nsは71.998Hz。Timewarpは4558フレームすべて有効、
+fast pathは4543フレームで有効。scanout補償は0。
+service起動ログ/metrics protobuf/pose診断ログは15にないため、GPU/ICD/commit/各眼実寸は
+このCSV単独では再確認できない。ユーザーの追加確認により、既にscale=100%を適用済み。
+以前の140%という推定は誤りだった。実際のアプリswapchain寸法は次回ログで確認する。
+
+全4558フレームでは66.162fps、起動/終了のfast path無効15フレームを除いた
+通常描画4543フレームでは66.481fps。以下は通常描画区間:
+
+| 区間 | p50 ms | p95 ms | p99 ms | max ms |
+|---|---:|---:|---:|---:|
+| compositor GPU query duration | 13.793 | 13.929 | 14.026 | 20.052 |
+| pose取得→KMS flip | 21.681 | 27.922 | 28.548 | 29.117 |
+| GPU query終了→KMS flip | 7.563 | 13.807 | 14.370 | 14.805 |
+| present要求→atomic commit | 6.437 | 12.742 | 13.398 | 13.726 |
+| flip更新間隔 | 13.889 | 27.776 | 27.789 | 27.866 |
+
+通常描画中の更新なしVBlankは377、desiredを0.5ms以上超えたflipは370/4543（8.14%）。
+submit済み未flipは最大2件、clock不明のflipは0、最後までflipのない要求は0。
+全区間のresource fence待ちはp50=0.022ms、queue idle待ちはp50=7.818ms。
+queue idle待ちは同じGPU workの終了待ちと重なるため、13.793+7.818msと加算してはいけない。
+present→commitも描画GPU workと重なっている。この集計は区間の合計でMTPを求めるものではない。
+
+13.889msの周期に対しGPU処理がほぼ1周期を占め、p95では周期を超える。
+一定のheadroom不足とVBlank待ちが提示遅れに寄与していることが観測できた。
+GPU query開始→終了は実行区間だが、メモリ/キャッシュ/依存待ちも含み得る。
+shader arithmetic、texture bandwidth、PanVKの効率のどれが支配的かはまだ分離できない。
+前回の公式光学補正で推奨描画サイズが増えたこととの因果関係も、今回だけでは断定しない。
+実測pose→flip約22msに加え、USB/サンプルの古さ、HMD内部処理/発光の遅延は未測定。
+arparaが未来予測しないというソース所見は残るが、今回のCSVにpose receiptがないため
+その遅延寄与を数値として分離していない。
+
+次のA/Bは既存service起動の `XRT_COMPOSITOR_SCALE_PERCENTAGE=100` を70へ変更する。
+最終出力3840×1920、71.998Hz、補正モデル/FOV、3画像、同期、場面は同一とし、
+アプリを再起動して変更した推奨サイズを反映する。物理モードやviewportは変更しない。
+100%なら推奨各眼2544×2544、70%なら約1780×1780になるが、実寸はアプリログで確認する。
+GPU処理時間が半減すると約束するものではない。帯域負荷等の寄与を測る診断であり、
+恒久的な画質変更とはしない。戻すときは100を明示する（変数を外すと既定140へ戻る）。
+CSV/summary/serviceログはbaselineと別名で保存し、同じ約60秒、同じ動きで比較する。
+GPU時間・pose→flip・VBlank遅れが改善するなら描画負荷への対処を優先し、
+変わらなければ最終出力の補正処理や同期を次の候補とする。
+pose診断は性能A/Bと分けて短時間の `ARPARA_POSE_TIMING=1` で取得する。
+
+### 実機ログ16（scale70%、hello_xr）
+
+ユーザーのserviceログでMonado `5e09a38c2`、Mali-G610 MC4/API1.4.354、
+card0/DP-1/CRTC82/plane39、3840×1920@71.998、pixel clock573290kHz、
+XRGB8888/LINEAR、3画像、sync FD→IN_FENCE_FD、最終extent3840×1920を確認。
+OUT_FENCE_PTRはsupportedだが未使用。正常終了時のKMS復元がログにある。
+CPU pixel copy/CPU release fence waitは0。ユーザー指定scale70%。
+描画API queueはCOMPUTE。CSVでfast path有効1663フレームを集計:
+
+| 通常描画の指標 | 15: scale100% | 16: scale70% |
+|---|---:|---:|
+| 更新fps | 66.481 | 66.925 |
+| GPU query duration p50 ms | 13.793 | 13.817 |
+| GPU query duration p95 ms | 13.929 | 14.372 |
+| pose取得→flip p50 ms | 21.681 | 21.618 |
+| pose取得→flip p95 ms | 27.922 | 27.927 |
+| desired超過 >0.5ms | 370/4543 (8.14%) | 126/1663 (7.58%) |
+
+100→70%で通常描画区間のGPU時間/pose→flipに大きな改善はない。
+画素数の減少に比例する改善もない。試験時間/温度/周波数/sceneは完全には固定できておらず、
+約0.44fpsの差を有意な改善とは扱わない。これ以上scaleを下げる優先度は下げる。
+最終合成は両試験とも3840×1920で、Computeの最終補正/出力処理が候補となる。
+正確なボトルネックの特定には、処理の別経路またはGPU内の段階別計測が必要。
+
+次の一変数A/Bはscaleを100%へ戻し、`XRT_COMPOSITOR_COMPUTE=0` を指定する。
+これは既存Graphics合成/ディストーションメッシュの経路。最終extent/モードを変えず、
+ComputeのSTORAGE画像に対してGraphicsはCOLOR_ATTACHMENT画像を要求する。
+DMA allocatorは要求usageごとにexportabilityを照会し、KMS importにもTEST_ONLYが必要。
+この実機でBGRA8_SRGB/LINEARのCOLOR_ATTACHMENT直接scanoutはまだ未検証。
+対応しなければ初期化エラーを保存し、Compute=1へ戻す。CPUコピーfallbackは追加しない。
+同期/3画像/レンズモデル/Timewarpを変更せず、同じhello_xr場面でGPU時間とpose→flipを比較する。
+既存機能の比較なので新しいビルドは不要。Graphicsが成功しても格子/左右中心/色と
+画像破損の有無を確認し、同じ光学モデルでもCompute lookupとmesh補間の差を考慮する。
+
+### 実機ログ17・18（72Hz、2026-10-11解析）
+
+17はユーザー指定scale20%。18の提供ディレクトリにはserviceの標準出力ログはなく
+`drm.csv` のみだが、ユーザーの追記した完全な起動コマンドで
+`XRT_COMPOSITOR_SCALE_PERCENTAGE=100`、`XRT_COMPOSITOR_COMPUTE=0` を確認した。
+18はGraphics指定、最終出力3840×1920@71.998、sync FD有効の試験として扱う。
+両CSVのfast_path=1区間を同じ基準で集計した。
+
+| 通常描画の指標 | 17: scale20% (1771 frames) | 18: Graphics、scale100% (2925 frames) |
+|---|---:|---:|
+| 更新fps | 66.686 | 71.999 |
+| GPU query duration p50/p95/p99/max ms | 13.804/14.137/14.276/20.806 | 2.104/2.446/3.273/6.042 |
+| pose取得→flip p50/p95/p99/max ms | 21.655/27.929/28.546/29.151 | 27.255/27.375/27.403/27.611 |
+| GPU完了→flip p50 ms | 7.531 | 24.811 |
+| present request→commit p50 ms | — | 13.168 |
+| commit→flip p50 ms | — | 13.852 |
+| flip間隔 p50/p95/max ms | 13.889/27.777/27.845 | 13.889/13.892/13.929 |
+| 更新のないVBlank数 | 141 | 0 |
+| desired超過 >0.5ms | 143/1771 | 0/2925 |
+
+17はscale100/70の結果とほぼ同じであり、アプリ推奨解像度の追加削減を優先しない。
+18はGPU処理の短縮と72Hzの安定提示を確認できたが、姿勢取得から提示までの遅延は
+約27msに伸びた。MTP改善やHMD発光遅延の改善としては扱わない。
+
+18のframe200ではpose取得を0msとしてGPU完了2.731ms、commit13.488ms、
+flip27.347ms。GPUが早く終わっても、以前のflipを待ってcommitする間に姿勢が古くなる。
+ソース上も `comp_drm_kms_queue_imported_fenced()` がcommit前に以前のflipをdrainする。
+完了フレームで数えたsubmit済み・未flipの最大数は2。
+`vkQueueWaitIdle` はp50 0.108msであり、18では全体同期CPU待ちの削除よりも
+pose取得/描画開始の時刻を後ろへ寄せる方が優先候補となる。
+
+次の最小実験は18のGraphics/scale100%設定を固定した上で、以前のflip待ちを
+pose取得より前へ移す、またはVBlank位相と測定GPU時間に基づく遅いwakeを
+opt-inで比較すること。3画像とqueued/scanout再利用禁止、sync FD handoffは維持する。
+単に予測budgetを短くすると、現状のcommit待ちを残したまま誤った早いdisplay timeを
+返す可能性があるため、予測時刻だけを変更しない。実機A/Bによるfps・deadline・
+pose取得→flipと光学的な表示確認を行うまで、既定動作には採用しない。
+
+### 次の実機A/B: pre-frame flip wait（実装済み、実機未検証）
+
+`XRT_COMPOSITOR_DRM_PRE_FRAME_WAIT=1` を追加した。既定は0（従来動作）。
+有効時はcompositor threadの `target_calc_frame_pacing()` で以前のflipをdrainし、
+その後に予測、multi compositorのlayer選択、Timewarp pose取得を行う。
+GPU描画後のpresent側drainも削除せず、slot再利用とFOREIGN ownershipの条件も維持する。
+フレームを提示直前に予測するため計画budgetは半周期へ変更する。
+これは固定の計画上の余裕であり、実測GPU時間や発光時刻として扱わない。
+開始時刻はdrain完了後すぐで、VBlank直前までさらに遅らせる変更は今回は行わない。
+
+Graphics（COMPUTE=0）とexport可能なsync FD handoffが必要。
+KMS handoffが使えなければ初期化失敗とし、CPU fence待ちへ自動fallbackしない。
+drain失敗時はtargetをfailedとし、以後のrender/acquireを拒否する。
+既存のtimeoutとhotplug/master loss処理を使用し、Vulkan queue lockを保持して待たない。
+3画像、IN_FENCE_FD、GPU全体同期、HID/IMU/光学補正を変更していない。
+
+まずOrange Pi側で全体をビルドし、同じbinaryでPRE_FRAME_WAIT=0/1を比較する。
+それぞれhello_xrを再起動し、同じ場面・動きで約60秒測定する。
+18と同じ72Hz/scale100/Graphicsを使用する。有効側の起動例:
+
+```bash
+cmake --build build --parallel 2
+XRT_COMPOSITOR_DRM_PRE_FRAME_WAIT=1 \
+XRT_COMPOSITOR_DRM_TRACE_FILE=/tmp/drm-pre-frame.csv \
+XRT_COMPOSITOR_SCALE_PERCENTAGE=100 XRT_COMPOSITOR_COMPUTE=0 \
+XRT_TRACKING_ORIGIN_OFFSET_Y=1.6 XRT_COMPOSITOR_DRM_SYNC_FD=1 \
+XRT_COMPOSITOR_FORCE_DRM=1 XRT_COMPOSITOR_DRM_DEVICE=/dev/dri/card0 \
+XRT_COMPOSITOR_DRM_CONNECTOR=DP-1 XRT_COMPOSITOR_DRM_MODE=3840x1920@71.998 \
+XRT_COMPOSITOR_FORCE_GPU_INDEX=0 \
+./build/src/xrt/targets/service/monado-service 2>&1 | tee -i /tmp/monado-pre-frame.log
+```
+
+従来側はPRE_FRAME_WAITを0とし、CSV/ログ名を別にする。
+正常停止後、`python3 scripts/analyze-drm-latency.py /tmp/drm-pre-frame.csv` で集計。
+新しい `pre_frame_wait` はpose取得より前の待ちであり、pose→flipやGPU時間と合算しない。
+期待する変化はpose→flip約27msから約1周期分の短縮、present→commit待ちの減少。
+これは実測結果ではない。fps/未更新VBlank/desired誤差/p95/p99と画面破損を比較する。
+アプリに伝える予測時刻も変わるため、アプリ描画遅れや古いlayerの再利用増加にも注意する。
+悪化した場合はPRE_FRAME_WAIT=0へ戻す。72Hzで確認後に90Hzを別測定する。
+
+今回のホスト全体ビルド成功、CTest 36/36成功（予測deadlineケースとpre-frame待ち集計を追加）。
+`monado-cli test` は終了0だが、ホスト上はSimulated HMDでありarpara実機回帰の証明ではない。
+検証ログは `build/arpara-validation/pre-frame-{build,tests,cli}.log`。
+ARM64ビルド、PanVK/KMS実機表示、MTP・主観的追従感の改善は未検証。
+
 既存buildの全体ビルドとCTestを実行する。KMS fault injectionではcommitの成功/失敗、
 sync FD所有権、queued/scanout再利用防止に加え、observerのimage対応/monotonic判定を確認する。
 pacerテストは上書きした予測が1回だけ適用されることを確認する。

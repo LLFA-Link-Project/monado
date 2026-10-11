@@ -22,7 +22,8 @@ def analyze(rows):
     frames = defaultdict(dict)
     for row in rows:
         frames[int(row["frame_id"])][row["event"]] = (int(row["monotonic_ns"]), int(row["value"]))
-    pairs = {"resource_wait": ("resource_wait_begin", "resource_wait_end"),
+    pairs = {"pre_frame_wait": ("pre_frame_wait_begin", "pre_frame_wait_end"),
+             "resource_wait": ("resource_wait_begin", "resource_wait_end"),
              "queue_idle_wait": ("queue_idle_begin", "queue_idle_end"),
              "submit_cpu": ("submit_begin", "submit_end"),
              "submit_to_gpu_end": ("submit_begin", "gpu_end"),

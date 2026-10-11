@@ -19,7 +19,7 @@ struct drm_kms_target
 	struct u_pacing_compositor *upc;
 	int64_t index, wake_ns, budget_ns;
 	unsigned next;
-	bool has_init_vulkan, failed, sync_fd;
+	bool has_init_vulkan, failed, sync_fd, pre_frame_wait;
 	FILE *trace;
 	int64_t slot_frames[COMP_DRM_IMAGES];
 	struct u_metrics_system_present_info prediction, slot_metrics[COMP_DRM_IMAGES];
@@ -49,6 +49,16 @@ static bool
 target_init_pre_vulkan(struct comp_target *ct)
 {
 	struct drm_kms_target *t = (void *)ct;
+	const char *pre_wait = getenv("XRT_COMPOSITOR_DRM_PRE_FRAME_WAIT");
+	if (pre_wait && strcmp(pre_wait, "0") && strcmp(pre_wait, "1")) {
+		COMP_ERROR(ct->c, "DRM_PRE_FRAME_WAIT must be 0 or 1");
+		return false;
+	}
+	t->pre_frame_wait = pre_wait && !strcmp(pre_wait, "1");
+	if (t->pre_frame_wait && ct->c->settings.use_compute) {
+		COMP_ERROR(ct->c, "DRM_PRE_FRAME_WAIT experiment requires XRT_COMPOSITOR_COMPUTE=0");
+		return false;
+	}
 	const char *connector = getenv("XRT_COMPOSITOR_DRM_CONNECTOR"), *mode = getenv("XRT_COMPOSITOR_DRM_MODE");
 	if (!connector || !mode || !*connector || !*mode) {
 		COMP_ERROR(ct->c,
@@ -115,6 +125,13 @@ target_init_post_vulkan(struct comp_target *ct, uint32_t width, uint32_t height)
 	}
 	t->sync_fd = (!sync || strcmp(sync, "0")) && vk->has_KHR_external_fence_fd &&
 	             comp_drm_dma_sync_fd_supported(vk->physical_device, vk->device);
+	if (t->pre_frame_wait && !t->sync_fd) {
+		COMP_ERROR(ct->c, "DRM_PRE_FRAME_WAIT experiment requires Vulkan sync FD handoff");
+		return false;
+	}
+	if (t->pre_frame_wait)
+		COMP_WARN(ct->c, "DRM pre-frame flip wait enabled: wait before prediction/pose; "
+		          "half-period planning budget, not measured GPU time; experimental");
 	if (sync && !strcmp(sync, "1") && !t->sync_fd) {
 		COMP_ERROR(ct->c, "Requested sync FD unavailable: plane IN_FENCE_FD=%d, external_fence_fd enabled=%d",
 		           comp_drm_kms_has_in_fence(t->kms), vk->has_KHR_external_fence_fd);
@@ -176,7 +193,7 @@ target_create_images(struct comp_target *ct,
 		}
 		if (t->sync_fd && !comp_drm_kms_supports_sync_fd(t->kms, i)) {
 			const char *sync = getenv("XRT_COMPOSITOR_DRM_SYNC_FD");
-			if (i || (sync && !strcmp(sync, "1"))) {
+			if (i || t->pre_frame_wait || (sync && !strcmp(sync, "1"))) {
 				COMP_ERROR(ct->c, "Requested KMS sync FD handoff unavailable for image %u", i);
 				t->failed = true;
 				return;
@@ -305,8 +322,9 @@ target_present(struct comp_target *ct,
 		          "CPU pixel copies=0; CPU release fence waits=%u; prediction budget=%.3f ms%s",
 		          t->sync_fd ? "release submit/export" : "release/GPU wait", t->gpu_wait_ns / 120e6,
 		          t->flip_wait_ns / 120e6, t->sync_fd ? 0 : 120,
-		          (t->budget_ns ? t->budget_ns : (int64_t)comp_drm_kms_period_ns(t->kms)) / 1e6,
-		          t->sync_fd ? " (fixed one-period estimate, not GPU time)" : " (wake-to-ready)");
+		          (t->pre_frame_wait ? period / 2 : (t->budget_ns ? t->budget_ns : period)) / 1e6,
+		          t->pre_frame_wait ? " (pre-frame wait, half-period allowance, not GPU time)"
+		                            : (t->sync_fd ? " (fixed one-period estimate, not GPU time)" : " (wake-to-ready)"));
 		t->gpu_wait_ns = t->flip_wait_ns = 0;
 	}
 	t->index = -1;
@@ -375,9 +393,20 @@ target_calc_frame_pacing(struct comp_target *ct,
 	int64_t predicted_display_time_ns = 0;
 	int64_t predicted_display_period_ns = 0;
 	int64_t min_display_period_ns = 0;
+	int64_t wait_begin_ns = os_monotonic_get_ns();
+	/* Drain on the compositor thread before prediction, layer selection and
+	 * timewarp pose fetch. Never wait while holding the Vulkan queue lock.
+	 * The existing present-side drain and slot lifetime checks remain intact. */
+	if (dit->pre_frame_wait && !dit->failed && !comp_drm_kms_pump(dit->kms, true)) {
+		dit->failed = true;
+		COMP_ERROR(ct->c, "DRM pre-frame flip wait failed; target disabled, no buffer reuse");
+	}
 	int64_t now_ns = os_monotonic_get_ns();
 	int64_t period = comp_drm_kms_period_ns(dit->kms);
-	int64_t budget = dit->budget_ns ? dit->budget_ns : period;
+	/* After retiring the previous flip, Graphics can target the next vblank.
+	 * This is a conservative planning allowance, not a GPU duration sample.
+	 * Late completion is still gated by IN_FENCE_FD and reported by the trace. */
+	int64_t budget = dit->pre_frame_wait ? period / 2 : (dit->budget_ns ? dit->budget_ns : period);
 	int64_t kms_present = comp_drm_predict_present(now_ns, comp_drm_kms_last_flip_ns(dit->kms), period, budget);
 	u_pc_fake_override_next_present(dit->upc, kms_present, now_ns);
 
@@ -403,6 +432,10 @@ target_calc_frame_pacing(struct comp_target *ct,
 	                                                         .predicted_display_time_ns = predicted_display_time_ns,
 	                                                         .present_slop_ns = present_slop_ns};
 	target_trace(ct, "predict", frame_id, now_ns, period);
+	if (dit->pre_frame_wait) {
+		target_trace(ct, "pre_frame_wait_begin", frame_id, wait_begin_ns, 0);
+		target_trace(ct, "pre_frame_wait_end", frame_id, now_ns, dit->failed);
+	}
 	target_trace(ct, "desired", frame_id, desired_present_time_ns, budget);
 	target_trace(ct, "display_estimate", frame_id, predicted_display_time_ns, offset);
 	*out_frame_id = frame_id;
