@@ -440,6 +440,65 @@ deadline/wakeの境界ケースと予定wake・実測wake・pose取得の分離�
 検証ログは `build/arpara-validation/late-wake-build.log` と `late-wake-tests.log`。
 今回変更のARM64ビルド、PanVK/KMS実機表示・遅延改善は未検証。
 
+### 実機ログ21: late wake 6ms
+
+fast_path=1の5917フレーム: 更新89.987fps、更新のないVBlank1、
+desired超過>0.5ms 2、submit済み未表示最大1、未flip要求0。
+pose取得→flip p50/p95/p99/max=5.781/5.878/5.936/17.042ms。
+20の中央値10.858msから5.077ms（46.8%）短縮した。
+GPU duration p50/p95/p99/max=2.223/2.921/3.135/6.888ms、
+submit→GPU完了p99=3.320ms、GPU完了→flip中央値3.240ms。
+実際のwake遅れはp50/p95/p99/max=0.015/0.067/0.117/0.938ms、
+wake→pose取得中央値0.198ms。同期エラーなし、正常終了/KMS復元あり。
+表示までの余裕をさらに削るとGPUの長いtailやwake jitterでVBlankを逃し得るため、
+まず6msの設定を固定して以下の姿勢予測を別の一変数A/Bとして評価する。
+ソフトウェア区間の改善であり、絶対MTP・物理的光学応答の実測ではない。
+
+### Monado relation historyによるarpara姿勢予測（実機未検証）
+
+従来arparaは `at_timestamp_ns` を無視して最新の融合姿勢を返していた。
+compositorのTimewarpは有効で、desired flip+固定4msを姿勢要求時刻として使っているが、
+arpara側に角速度を用いた未来外挿はなかった。固定4msはpacer由来の推定であり、
+arparaの発光/scanout測定に由来しない。今回もこの値を無根拠に変更しない。
+
+ユーザー指定に従い独自外挿式を追加せず、Monadoの `m_relation_history` を使用する。
+受信ごとの融合姿勢とbias補正済みジャイロをrelationに保存する。
+body座標のrad/sを融合quaternionでtracking/world座標へ変換してangular_velocityに設定。
+`m_relation_history_get()` が過去を補間し、未来を `m_predict_relation()` によって外挿する。
+この既存関数がworld角速度をbodyへ戻して姿勢積分するため、二重回転/軸順序誤りを避ける。
+予測結果を履歴やfusionへ再投入せず、各要求は同じ未予測のIMU履歴から計算する。
+
+service側 `ARPARA_POSE_PREDICTION_MS=10` で有効化。値は0〜20の整数、既定0。
+指定値は外挿の最大時間であり、毎回固定の時間を追加する値ではない。
+requested timestampと最新履歴時刻の差を上限で制限して照会する。
+過去20ms内の照会にはhistoryの補間/完全一致を使い、最古以前へのreverse predictionは採用しない。
+切断/追跡準備前/host受信から20ms超の古いサンプルは外挿しない。
+counter再seed時には履歴をclearし、タイミング不連続をまたいで補間しない。
+positionは固定原点のvalidのみでPOSITION_TRACKEDを付けず、3DoFを維持する。
+
+fusion間隔は引き続きdevice counterを使用する。履歴照会の基準時刻はhost monotonicの
+受信時刻とし、未同期の積算fusion_nsをhost時刻と直接比較しない。
+これは同期されたIMU capture timeではなくUSB/HID受信のproxyで、輸送遅延や
+gyro mounting/bias、IMU-to-eye変換、HMD発光の未校正分は残る。
+要求時刻を尊重した予測であっても、正しい絶対MTPや完全な発光同期は未実証。
+
+21の起動コマンドに `ARPARA_POSE_PREDICTION_MS=10` だけを追加し、
+WAKE_BUDGET_US=6000、90.001Hz、Graphics、scale100、同じsceneを維持して約60秒比較する。
+CSV/ログを別名で保存し、予測0への切り戻しと比較する。
+GPU/fpsを変える最適化ではなく、回転中に表示される姿勢を新しくする比較。
+頭を回す/止める/反転する際のovershootや静止時の揺れ、左右の見え方を確認する。
+`ARPARA_POSE_TIMING=1` は別の短い診断runで使用し、要求/受信/query/fusion時刻に加え
+prediction_ns、history_resultを記録する（PREDICTED=3、INTERPOLATED=2、EXACT=1）。
+Python集計の `--pose-log` はapplied_prediction分布も出力する。
+大量ログの有無を変えた結果を同じ負荷の性能A/Bとして混ぜない。
+
+予測の上限/鮮度、rad/sの角度、非identity姿勢のbody/world変換、historyの
+EXACT/INTERPOLATED/PREDICTED、ゼロ角速度、位置追跡を偽装しないflagsを自動テスト。
+予測有効の模擬HID起動・未来姿勢取得・切断もCTestに追加。
+ホスト全体ビルド・CTest 37/37成功。ARM64ビルド・実機予測の追従改善は未検証。
+検証ログは `build/arpara-validation/pose-prediction-{build,tests}.log`。
+KMS、DMA-BUF、sync FD、3画像、6ms wake、光学補正、HID protocolは変更しない。
+
 既存buildの全体ビルドとCTestを実行する。KMS fault injectionではcommitの成功/失敗、
 sync FD所有権、queued/scanout再利用防止に加え、observerのimage対応/monotonic判定を確認する。
 pacerテストは上書きした予測が1回だけ適用されることを確認する。

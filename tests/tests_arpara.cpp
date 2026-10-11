@@ -3,6 +3,7 @@
 #include "catch_amalgamated.hpp"
 #include "arpara/arpara_interface.h"
 #include "arpara/arpara_protocol.h"
+#include "arpara/arpara_prediction.h"
 #include "os/os_hid.h"
 #include "os/os_time.h"
 #include "util/u_device.h"
@@ -19,6 +20,64 @@
 #include <vector>
 
 using Report = std::array<uint8_t, 64>;
+
+TEST_CASE("arpara prediction is bounded by freshness and requested host time")
+{
+	const int64_t sample = 1000000000;
+	CHECK(arpara_prediction_horizon(sample, sample + 1000000, sample + 9000000, 10000000) == 9000000);
+	CHECK(arpara_prediction_horizon(sample, sample + 1000000, sample + 50000000, 10000000) == 10000000);
+	CHECK(arpara_prediction_horizon(sample, sample + 1000000, sample + 9000000, 0) == 0);
+	CHECK(arpara_prediction_horizon(sample, sample + 30000000, sample + 50000000, 10000000) == 0);
+	CHECK(arpara_prediction_horizon(sample, sample - 1, sample + 1000000, 10000000) == 0);
+	CHECK(arpara_prediction_horizon(sample, sample + 1000000, sample + 500000, 10000000) == 0);
+	CHECK(arpara_prediction_horizon(0, sample, sample + 1000000, 10000000) == 0);
+}
+
+TEST_CASE("arpara history predicts world-space angular velocity with body-space rotation order")
+{
+	m_relation_history *history = nullptr;
+	m_relation_history_create(&history);
+	xrt_quat q = {0, 0, 0, 1};
+	xrt_vec3 gyro = {0, 1, 0}; // rad/s
+	auto rel = arpara_history_sample(&q, &gyro, true);
+	REQUIRE(m_relation_history_push(history, &rel, 1000000000));
+	xrt_space_relation result;
+	REQUIRE(m_relation_history_get(history, 1010000000, &result) == M_RELATION_HISTORY_RESULT_PREDICTED);
+	auto out = result.pose.orientation;
+	CHECK(out.y == Catch::Approx(std::sin(.005)).margin(1e-6));
+	CHECK(out.w == Catch::Approx(std::cos(.005)).margin(1e-6));
+	CHECK(q.w == 1); // Prediction never feeds back into fusion.
+	CHECK_FALSE(result.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	CHECK(result.pose.position.y == 0);
+	// A 90 degree roll maps local +Y onto world -X: verify body-space order.
+	q = {0, 0, float(std::sin(.7853981633974483)), float(std::cos(.7853981633974483))};
+	rel = arpara_history_sample(&q, &gyro, true);
+	CHECK(rel.angular_velocity.x == Catch::Approx(-1).margin(1e-6));
+	m_relation_history_clear(history);
+	REQUIRE(m_relation_history_push(history, &rel, 1000000000));
+	REQUIRE(m_relation_history_get(history, 1010000000, &result) == M_RELATION_HISTORY_RESULT_PREDICTED);
+	out = result.pose.orientation;
+	CHECK(out.x == Catch::Approx(-q.z * std::sin(.005)).margin(1e-6));
+	CHECK(out.y == Catch::Approx(q.w * std::sin(.005)).margin(1e-6));
+	CHECK(out.x * out.x + out.y * out.y + out.z * out.z + out.w * out.w == Catch::Approx(1));
+	REQUIRE(m_relation_history_get(history, 1000000000, &result) == M_RELATION_HISTORY_RESULT_EXACT);
+	out = result.pose.orientation;
+	CHECK(out.x == q.x);
+	CHECK(out.z == q.z);
+	gyro = {};
+	rel = arpara_history_sample(&q, &gyro, true);
+	m_relation_history_clear(history);
+	REQUIRE(m_relation_history_push(history, &rel, 1000000000));
+	REQUIRE(m_relation_history_get(history, 1010000000, &result) == M_RELATION_HISTORY_RESULT_PREDICTED);
+	out = result.pose.orientation;
+	CHECK(out.z == Catch::Approx(q.z));
+	REQUIRE(m_relation_history_push(history, &rel, 1020000000));
+	CHECK(m_relation_history_get(history, 1010000000, &result) == M_RELATION_HISTORY_RESULT_INTERPOLATED);
+	rel = arpara_history_sample(&q, &gyro, false);
+	CHECK_FALSE(rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
+	CHECK_FALSE(rel.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+	m_relation_history_destroy(&history);
+}
 
 static uint8_t
 sum8(const uint8_t *p, size_t n)
@@ -262,6 +321,15 @@ TEST_CASE("arpara real HMD creation, startup, fusion and disconnect with fake HI
 	CHECK(pose.pose.position.x == 0);
 	CHECK(pose.pose.position.y == 0);
 	CHECK(pose.pose.position.z == 0);
+	const char *prediction_option = getenv("ARPARA_POSE_PREDICTION_MS");
+	if (prediction_option && atoi(prediction_option) > 0) {
+		CHECK(wait_until([&] {
+			d->get_tracked_pose(d, XRT_INPUT_GENERIC_HEAD_POSE, os_monotonic_get_ns() + 5000000, &pose);
+			return (pose.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0;
+		}));
+		CHECK_FALSE(pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		CHECK(std::isfinite(pose.pose.orientation.w));
+	}
 	CHECK(d->get_tracked_pose(d, XRT_INPUT_GENERIC_GRIP_POSE, 0, &pose) == XRT_ERROR_INPUT_UNSUPPORTED);
 	hid->unplugged = true;
 	CHECK(wait_until([&] {
@@ -271,6 +339,7 @@ TEST_CASE("arpara real HMD creation, startup, fusion and disconnect with fake HI
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0);
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
 	CHECK((pose.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) != 0);
+	CHECK_FALSE(pose.relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
 	CHECK(pose.pose.position.x == 0);
 	CHECK(pose.pose.position.y == 0);
 	CHECK(pose.pose.position.z == 0);

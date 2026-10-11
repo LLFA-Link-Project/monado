@@ -21,7 +21,7 @@ if(XRT_BUILD_DRIVER_ARPARA)
 	    VERBATIM)
 	add_subdirectory(arpara/rust)
 	add_library(drv_arpara STATIC arpara/arpara_hmd.cpp arpara/arpara_interface.h arpara/arpara_protocol.h
-	    arpara/arpara_optics.cpp arpara/arpara_optics.h "${_arpara_optics_header}")
+	    arpara/arpara_optics.cpp arpara/arpara_optics.h arpara/arpara_prediction.h "${_arpara_optics_header}")
 	target_include_directories(drv_arpara PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 	target_link_libraries(drv_arpara PRIVATE xrt-interfaces aux_util aux_os aux_math arpara_rust)
 	list(APPEND ENABLED_HEADSET_DRIVERS arpara)

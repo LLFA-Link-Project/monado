@@ -100,6 +100,7 @@ def analyze_pose(text):
     return {"host_receipt_age": stats([query - receipt for _, receipt, query, _ in samples]),
             "requested_future_horizon": stats([requested - query for requested, _, query, _ in samples]),
             "receipt_minus_integrated_device_time": stats([receipt - fusion for _, receipt, _, fusion in samples]),
+            "applied_prediction": stats([int(ns) for ns in re.findall(r"prediction_ns=(\d+)", text)]),
             "note": "host receipt age excludes USB/device latency; fusion clock is anchored and integrated, not synchronized capture time"}
 
 

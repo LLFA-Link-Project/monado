@@ -3,6 +3,7 @@
 #include "arpara_interface.h"
 #include "arpara_protocol.h"
 #include "arpara_optics.h"
+#include "arpara_prediction.h"
 #include "math/m_imu_3dof.h"
 #include "os/os_hid.h"
 #include "os/os_threading.h"
@@ -13,6 +14,7 @@
 #include "util/u_visibility_mask.h"
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 static_assert(sizeof(arpara_rs_decoded) == 112, "Rust/C++ report ABI size mismatch");
 static_assert(alignof(arpara_rs_decoded) == 4, "Rust/C++ report ABI alignment mismatch");
@@ -31,6 +33,8 @@ struct arpara_hmd
 	struct os_mutex mutex;
 	struct m_imu_3dof fusion;
 	struct xrt_quat orientation;
+	struct m_relation_history *relation_history;
+	int64_t prediction_limit_ns;
 	uint64_t last_host_ns;
 	uint64_t fusion_ns;
 	uint64_t sample_fusion_ns;
@@ -104,6 +108,12 @@ handle_report(struct arpara_hmd *h, const uint8_t *p, size_t n)
 	m_imu_3dof_update(&h->fusion, h->fusion_ns, &accel, &gyro);
 	os_mutex_lock(&h->mutex);
 	h->orientation = h->fusion.rot;
+	struct xrt_vec3 gyro_body = {gyro.x - h->fusion.gyro_bias.value.x, gyro.y - h->fusion.gyro_bias.value.y,
+	                           gyro.z - h->fusion.gyro_bias.value.z};
+	struct xrt_space_relation relation = arpara_history_sample(&h->orientation, &gyro_body, ready);
+	if (!ready)
+		m_relation_history_clear(h->relation_history); // Do not interpolate across timing resets.
+	m_relation_history_push(h->relation_history, &relation, now);
 	h->last_host_ns = now;
 	h->sample_fusion_ns = h->fusion_ns;
 	h->orientation_ready = ready;
@@ -212,7 +222,7 @@ get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at_timestamp
 	if (name != XRT_INPUT_GENERIC_HEAD_POSE) {
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
-	/* Latest sample only: no speculative prediction with unverified calibration. */
+	/* Optional bounded extrapolation from one atomic IMU snapshot. */
 	*out = {};
 	os_mutex_lock(&h->mutex);
 	uint64_t sample_ns = h->last_host_ns;
@@ -227,14 +237,30 @@ get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at_timestamp
 		out->relation_flags =
 		    (enum xrt_space_relation_flags)(out->relation_flags | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 	}
+	int64_t prediction_ns = 0;
+	enum m_relation_history_result history_result = M_RELATION_HISTORY_RESULT_INVALID;
+	if (out->relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) {
+		prediction_ns = arpara_prediction_horizon(sample_ns, query_ns, at_timestamp_ns, h->prediction_limit_ns);
+		int64_t history_time = prediction_ns ? (int64_t)sample_ns + prediction_ns : at_timestamp_ns;
+		bool historical = history_time > 0 && history_time <= (int64_t)sample_ns &&
+		                  (int64_t)sample_ns - history_time <= 20000000 &&
+		                  query_ns >= (int64_t)sample_ns && query_ns - (int64_t)sample_ns <= 20000000;
+		if (h->prediction_limit_ns && (prediction_ns || historical)) {
+			struct xrt_space_relation relation;
+			history_result = m_relation_history_get(h->relation_history, history_time, &relation);
+			if (history_result != M_RELATION_HISTORY_RESULT_INVALID &&
+			    history_result != M_RELATION_HISTORY_RESULT_REVERSE_PREDICTED)
+				*out = relation;
+		}
+	}
 	os_mutex_unlock(&h->mutex);
 	if (debug_get_bool_option_arpara_pose_timing()) {
 		U_LOG_I(
 		    "arpara pose timing: requested_ns=%lld receipt_ns=%llu query_ns=%lld fusion_ns=%llu "
-		    "orientation=[%.6f,%.6f,%.6f,%.6f]; prediction=none",
+		    "orientation=[%.6f,%.6f,%.6f,%.6f]; prediction_ns=%lld history_result=%d (host receipt proxy)",
 		    (long long)at_timestamp_ns, (unsigned long long)sample_ns, (long long)query_ns,
 		    (unsigned long long)device_time_ns, out->pose.orientation.x, out->pose.orientation.y,
-		    out->pose.orientation.z, out->pose.orientation.w);
+		    out->pose.orientation.z, out->pose.orientation.w, (long long)prediction_ns, (int)history_result);
 	}
 	return XRT_SUCCESS;
 }
@@ -264,6 +290,7 @@ destroy(struct xrt_device *xdev)
 	U_LOG_I("arpara: closed HID, received %llu IMU samples", (unsigned long long)h->samples);
 	os_hid_destroy(h->hid);
 	m_imu_3dof_close(&h->fusion);
+	m_relation_history_destroy(&h->relation_history);
 	os_mutex_destroy(&h->mutex);
 	u_device_free(xdev);
 }
@@ -278,6 +305,29 @@ arpara_create(struct os_hid_device *hid)
 		return NULL;
 	}
 	h->hid = hid;
+	const char *prediction = getenv("ARPARA_POSE_PREDICTION_MS");
+	if (prediction) {
+		unsigned ms = 0;
+		bool valid = *prediction != '\0';
+		for (const char *p = prediction; valid && *p; p++) {
+			if (*p < '0' || *p > '9' || ms > 20) {
+				valid = false;
+				break;
+			}
+			ms = ms * 10 + (unsigned)(*p - '0');
+		}
+		if (!valid || ms > 20) {
+			U_LOG_E("arpara: ARPARA_POSE_PREDICTION_MS must be an integer from 0 to 20");
+			os_hid_destroy(hid);
+			u_device_free(&h->base);
+			return NULL;
+		}
+		h->prediction_limit_ns = (int64_t)ms * 1000000;
+	}
+	if (h->prediction_limit_ns)
+		U_LOG_W("arpara: experimental requested-time orientation prediction, limit=%.1f ms; "
+		        "host receipt proxy, IMU axes/display emission uncalibrated; 3DoF only",
+		        h->prediction_limit_ns / 1e6);
 	if (os_mutex_init(&h->mutex) != 0) {
 		os_hid_destroy(hid);
 		u_device_free(&h->base);
@@ -289,6 +339,7 @@ arpara_create(struct os_hid_device *hid)
 		u_device_free(&h->base);
 		return NULL;
 	}
+	m_relation_history_create(&h->relation_history);
 	m_imu_3dof_init(&h->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_300MS);
 	h->orientation.w = 1;
 	struct xrt_device *d = &h->base;

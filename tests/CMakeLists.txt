@@ -163,6 +163,8 @@ if(XRT_BUILD_DRIVER_ARPARA)
 	endif()
 	add_test(NAME tests_arpara_fixed COMMAND ${CMAKE_COMMAND} -E env ARPARA_IMU=false
 		${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:tests_arpara> "[fixed]")
+	add_test(NAME tests_arpara_prediction COMMAND ${CMAKE_COMMAND} -E env ARPARA_POSE_PREDICTION_MS=10
+		${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:tests_arpara>)
 	set(_arpara_rust_test_args)
 	set(_arpara_rust_test_env)
 	if(ARPARA_RUST_TARGET)

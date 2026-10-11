@@ -32,6 +32,9 @@ class AnalysisTest(unittest.TestCase):
         self.assertEqual(result["host_receipt_age"]["p50_ms"], 1)
         self.assertEqual(result["requested_future_horizon"]["p95_ms"], 1)
         self.assertEqual(result["receipt_minus_integrated_device_time"]["max_ms"], .5)
+        self.assertIsNone(result["applied_prediction"])
+        result = module.analyze_pose(text + " prediction_ns=9000000 history_result=3")
+        self.assertEqual(result["applied_prediction"]["p50_ms"], 9)
     def test_missing_gpu_and_unmapped_clock_are_not_measurements(self):
         rows = [{"event": "flip_receipt", "frame_id": 1, "monotonic_ns": 123, "value": 1}]
         result = module.analyze(rows)
