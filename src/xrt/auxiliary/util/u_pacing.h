@@ -749,6 +749,11 @@ u_pc_display_timing_create(int64_t estimated_frame_period_ns,
 xrt_result_t
 u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pacing_compositor **out_upc);
 
+/* Only for pacers created by u_pc_fake_create: set the next prediction before
+ * its frame record and metrics are written. Consumed by the next predict call. */
+void
+u_pc_fake_override_next_present(struct u_pacing_compositor *upc, int64_t present_ns, int64_t wake_ns);
+
 /*!
  * Creates a new application pacing factory helper.
  *

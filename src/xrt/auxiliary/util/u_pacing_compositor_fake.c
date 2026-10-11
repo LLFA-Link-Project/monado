@@ -103,6 +103,8 @@ struct frame
 struct fake_timing
 {
 	struct u_pacing_compositor base;
+	bool override_next;
+	int64_t override_present_ns, override_wake_ns;
 
 	/*!
 	 * The periodicity of the display.
@@ -158,6 +160,15 @@ get_frame_or_null(struct fake_timing *ft, int64_t frame_id)
 	}
 	// Just drop it, doesn't happen during normal operation.
 	return NULL;
+}
+
+void
+u_pc_fake_override_next_present(struct u_pacing_compositor *upc, int64_t present_ns, int64_t wake_ns)
+{
+	struct fake_timing *ft = fake_timing(upc);
+	ft->override_next = true;
+	ft->override_present_ns = present_ns;
+	ft->override_wake_ns = wake_ns;
 }
 
 static struct frame *
@@ -300,9 +311,14 @@ pc_predict(struct u_pacing_compositor *upc,
 
 	int64_t frame_id = f->frame_id;
 	int64_t desired_present_time_ns = predict_next_frame_present_time(ft, now_ns);
+	if (ft->override_next)
+		desired_present_time_ns = ft->override_present_ns;
 	int64_t predicted_display_time_ns = calc_display_time(ft, desired_present_time_ns);
 
 	int64_t wake_up_time_ns = desired_present_time_ns - ft->comp_time_ns;
+	if (ft->override_next)
+		wake_up_time_ns = ft->override_wake_ns;
+	ft->override_next = false;
 	int64_t present_slop_ns = U_TIME_HALF_MS_IN_NS;
 	int64_t predicted_display_period_ns = ft->frame_period_ns;
 	int64_t min_display_period_ns = ft->frame_period_ns;

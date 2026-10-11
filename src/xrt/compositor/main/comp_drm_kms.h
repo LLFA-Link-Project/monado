@@ -6,6 +6,11 @@
 #include <stdio.h>
 
 struct comp_drm_kms;
+/* Commit/flip observations run on the caller's event-pump thread. A flip_receipt
+ * is NOT a kernel presentation timestamp when the event clock is unmapped. */
+typedef void (*comp_drm_kms_observer)(void *data, const char *event, int index, uint64_t ns, uint64_t value);
+void
+comp_drm_kms_set_observer(struct comp_drm_kms *k, comp_drm_kms_observer observer, void *data);
 /* No display change in open, list, prepare, or test. Connector and mode must
  * be explicitly selected for anything beyond enumeration. */
 struct comp_drm_kms *

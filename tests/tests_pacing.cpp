@@ -21,6 +21,23 @@
 using namespace std::chrono_literals;
 using namespace std::chrono;
 
+TEST_CASE("DRM fake pacer records the externally selected prediction once", "[pacing][drm]")
+{
+	u_pacing_compositor *pacer = nullptr;
+	const int64_t now = 1000000000, period = 11111000;
+	u_pc_fake_create(period, now, &pacer);
+	int64_t id, wake, present, slop, display, predicted_period, minimum;
+	u_pc_fake_override_next_present(pacer, now + 2 * period, now);
+	u_pc_predict(pacer, now, &id, &wake, &present, &slop, &display, &predicted_period, &minimum);
+	CHECK(wake == now);
+	CHECK(present == now + 2 * period);
+	CHECK(display > present);
+	u_pc_predict(pacer, now + 4 * period, &id, &wake, &present, &slop, &display, &predicted_period, &minimum);
+	CHECK(wake >= now + 4 * period);
+	CHECK(present != now + 2 * period);
+	u_pc_destroy(&pacer);
+}
+
 static constexpr unanoseconds frame_interval_ns(16ms);
 
 namespace {

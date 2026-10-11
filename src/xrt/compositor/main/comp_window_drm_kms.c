@@ -6,6 +6,7 @@
 #include "comp_drm_pipeline.h"
 #include "comp_drm_geometry.h"
 #include "util/u_pacing.h"
+#include "util/u_metrics.h"
 #include <stdlib.h>
 #include <string.h>
 struct drm_kms_target
@@ -19,7 +20,31 @@ struct drm_kms_target
 	int64_t index, wake_ns, budget_ns;
 	unsigned next;
 	bool has_init_vulkan, failed, sync_fd;
+	FILE *trace;
+	int64_t slot_frames[COMP_DRM_IMAGES];
+	struct u_metrics_system_present_info prediction, slot_metrics[COMP_DRM_IMAGES];
 };
+static void
+target_trace(struct comp_target *ct, const char *event, int64_t frame_id, int64_t ns, int64_t value)
+{
+	struct drm_kms_target *t = (void *)ct;
+	if (t->trace)
+		fprintf(t->trace, "%s,%lld,%lld,%lld\n", event, (long long)frame_id, (long long)ns, (long long)value);
+}
+static void
+kms_observe(void *data, const char *event, int index, uint64_t ns, uint64_t value)
+{
+	struct drm_kms_target *t = data;
+	if (index >= 0 && index < COMP_DRM_IMAGES) {
+		target_trace(&t->base, event, t->slot_frames[index], ns, value);
+		if (!strcmp(event, "flip") && u_metrics_is_active()) {
+			struct u_metrics_system_present_info *info = &t->slot_metrics[index];
+			info->actual_present_time_ns = ns;
+			info->when_infoed_ns = os_monotonic_get_ns();
+			u_metrics_write_system_present_info(info);
+		}
+	}
+}
 static bool
 target_init_pre_vulkan(struct comp_target *ct)
 {
@@ -34,15 +59,19 @@ target_init_pre_vulkan(struct comp_target *ct)
 	t->kms = comp_drm_kms_open(getenv("XRT_COMPOSITOR_DRM_DEVICE"), stderr);
 	if (!t->kms || !comp_drm_kms_prepare(t->kms, connector, mode, 0))
 		return false;
+	comp_drm_kms_set_observer(t->kms, kms_observe, t);
 	uint32_t w = comp_drm_kms_width(t->kms), h = comp_drm_kms_height(t->kms);
 	struct comp_settings *s = &ct->c->settings;
 	bool output_profile = comp_drm_arpara_output_viewports(ct->c->xdev, w, h, ct->output_viewports);
 	if (output_profile) {
 		ct->output_viewport_count = 2;
-		COMP_INFO(ct->c, "DRM output geometry: %ux%u, left=(0,0,1920,1920) right=(1920,0,1920,1920); "
-		                   "application recommended extents unchanged", w, h);
-		COMP_WARN(ct->c, "arpara output profile preserves provisional driver SBS ordering; "
-		                   "physical eye ordering, panel native resolution and optical calibration unverified.");
+		COMP_INFO(ct->c,
+		          "DRM output geometry: %ux%u, left=(0,0,1920,1920) right=(1920,0,1920,1920); "
+		          "application recommended extents unchanged",
+		          w, h);
+		COMP_WARN(ct->c,
+		          "arpara output profile preserves provisional driver SBS ordering; "
+		          "physical eye ordering, panel native resolution and optical calibration unverified.");
 	} else if ((uint64_t)w * s->preferred.height != (uint64_t)h * s->preferred.width) {
 		const char *allow = getenv("XRT_COMPOSITOR_DRM_ALLOW_STRETCH");
 		if (!allow || strcmp(allow, "1")) {
@@ -182,9 +211,8 @@ target_create_images(struct comp_target *ct,
 	ct->final_layout = VK_IMAGE_LAYOUT_GENERAL;
 	ct->surface_transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	ct->present_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	COMP_INFO(ct->c, "DRM final render extent=%ux%u, framebuffer=%ux%u, output viewports=%u",
-	          ct->width, ct->height, comp_drm_kms_width(t->kms), comp_drm_kms_height(t->kms),
-	          ct->output_viewport_count);
+	COMP_INFO(ct->c, "DRM final render extent=%ux%u, framebuffer=%ux%u, output viewports=%u", ct->width, ct->height,
+	          comp_drm_kms_width(t->kms), comp_drm_kms_height(t->kms), ct->output_viewport_count);
 }
 static bool
 target_has_images(struct comp_target *ct)
@@ -246,6 +274,12 @@ target_present(struct comp_target *ct,
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
 	int64_t begin = os_monotonic_get_ns();
+	t->slot_frames[index] = ct->c->frame.rendering.id;
+	t->slot_metrics[index] = t->prediction;
+	t->slot_metrics[index].frame_id = t->slot_frames[index];
+	t->slot_metrics[index].desired_present_time_ns = desired;
+	t->slot_metrics[index].predicted_display_time_ns = ct->c->frame.rendering.predicted_display_time_ns;
+	target_trace(ct, "present_request", t->slot_frames[index], begin, index);
 	vk_queue_lock(queue);
 	int fd = -1;
 	VkResult ret =
@@ -253,6 +287,7 @@ target_present(struct comp_target *ct,
 	               : comp_drm_dma_release(t->dma[index], queue->queue, ct->semaphores.render_complete, false);
 	vk_queue_unlock(queue);
 	int64_t ready = os_monotonic_get_ns();
+	target_trace(ct, "release_return", t->slot_frames[index], ready, t->sync_fd);
 	if (ret != VK_SUCCESS || !comp_drm_kms_queue_imported_fenced(t->kms, index, fd)) {
 		t->failed = true;
 		COMP_ERROR(ct->c, "DRM present failed VkResult=%d; no buffer reuse", ret);
@@ -311,6 +346,8 @@ target_destroy(struct comp_target *ct)
 	struct drm_kms_target *t = (void *)ct;
 	struct vk_bundle *vk = &ct->c->base.vk;
 	comp_drm_kms_close(t->kms);
+	if (t->trace)
+		fclose(t->trace);
 	if (t->has_init_vulkan) {
 		vk->vkDeviceWaitIdle(vk->device);
 		for (unsigned i = 0; i < COMP_DRM_IMAGES; i++)
@@ -339,6 +376,10 @@ target_calc_frame_pacing(struct comp_target *ct,
 	int64_t predicted_display_period_ns = 0;
 	int64_t min_display_period_ns = 0;
 	int64_t now_ns = os_monotonic_get_ns();
+	int64_t period = comp_drm_kms_period_ns(dit->kms);
+	int64_t budget = dit->budget_ns ? dit->budget_ns : period;
+	int64_t kms_present = comp_drm_predict_present(now_ns, comp_drm_kms_last_flip_ns(dit->kms), period, budget);
+	u_pc_fake_override_next_present(dit->upc, kms_present, now_ns);
 
 	u_pc_predict(dit->upc,                     //
 	             now_ns,                       //
@@ -350,14 +391,20 @@ target_calc_frame_pacing(struct comp_target *ct,
 	             &predicted_display_period_ns, //
 	             &min_display_period_ns);      //
 
-	int64_t period = comp_drm_kms_period_ns(dit->kms);
-	int64_t budget = dit->budget_ns ? dit->budget_ns : period;
 	int64_t offset = predicted_display_time_ns - desired_present_time_ns;
-	desired_present_time_ns = comp_drm_predict_present(now_ns, comp_drm_kms_last_flip_ns(dit->kms), period, budget);
 	/* FIFO/backpressure limits work to available scanout slots. Start immediately
 	 * instead of imposing an unrelated fake 3ms wake-up budget on a GPU-bound queue. */
 	wake_up_time_ns = now_ns;
 	predicted_display_time_ns = desired_present_time_ns + offset;
+	dit->prediction = (struct u_metrics_system_present_info){.frame_id = frame_id,
+	                                                         .when_predict_ns = now_ns,
+	                                                         .predicted_wake_up_time_ns = wake_up_time_ns,
+	                                                         .desired_present_time_ns = desired_present_time_ns,
+	                                                         .predicted_display_time_ns = predicted_display_time_ns,
+	                                                         .present_slop_ns = present_slop_ns};
+	target_trace(ct, "predict", frame_id, now_ns, period);
+	target_trace(ct, "desired", frame_id, desired_present_time_ns, budget);
+	target_trace(ct, "display_estimate", frame_id, predicted_display_time_ns, offset);
 	*out_frame_id = frame_id;
 	*out_wake_up_time_ns = wake_up_time_ns;
 	*out_desired_present_time_ns = desired_present_time_ns;
@@ -369,19 +416,26 @@ static void
 target_mark_timing_point(struct comp_target *ct, enum comp_target_timing_point point, int64_t frame_id, int64_t when_ns)
 {
 	struct drm_kms_target *dit = (struct drm_kms_target *)ct;
+	const char *names[] = {"wake", "begin", "submit_begin", "submit_end"};
+	/* Explicit switch below retains the target timing contract. */
+	if (point >= COMP_TARGET_TIMING_POINT_WAKE_UP && point <= COMP_TARGET_TIMING_POINT_SUBMIT_END)
+		target_trace(ct, names[point - COMP_TARGET_TIMING_POINT_WAKE_UP], frame_id, when_ns, 0);
 
 	switch (point) {
 	case COMP_TARGET_TIMING_POINT_WAKE_UP:
+		dit->prediction.when_woke_ns = when_ns;
 		dit->wake_ns = when_ns;
 		u_pc_mark_point(dit->upc, U_TIMING_POINT_WAKE_UP, frame_id, when_ns);
 		break;
 	case COMP_TARGET_TIMING_POINT_BEGIN: //
+		dit->prediction.when_began_ns = when_ns;
 		u_pc_mark_point(dit->upc, U_TIMING_POINT_BEGIN, frame_id, when_ns);
 		break;
 	case COMP_TARGET_TIMING_POINT_SUBMIT_BEGIN:
 		u_pc_mark_point(dit->upc, U_TIMING_POINT_SUBMIT_BEGIN, frame_id, when_ns);
 		break;
 	case COMP_TARGET_TIMING_POINT_SUBMIT_END:
+		dit->prediction.when_submitted_ns = when_ns;
 		u_pc_mark_point(dit->upc, U_TIMING_POINT_SUBMIT_END, frame_id, when_ns);
 		break;
 	default: assert(false);
@@ -394,6 +448,8 @@ target_info_gpu(struct comp_target *ct, int64_t frame_id, int64_t gpu_start_ns, 
 	struct drm_kms_target *dit = (struct drm_kms_target *)ct;
 
 	u_pc_info_gpu(dit->upc, frame_id, gpu_start_ns, gpu_end_ns, when_ns);
+	target_trace(ct, "gpu_start", frame_id, gpu_start_ns, 0);
+	target_trace(ct, "gpu_end", frame_id, gpu_end_ns, 0);
 }
 
 
@@ -428,6 +484,18 @@ factory_create(const struct comp_target_factory *f, struct comp_compositor *c, s
 	                               .queue_supports_present = target_queue_supports_present,
 	                               .destroy = target_destroy};
 	t->index = -1;
+	const char *trace_path = getenv("XRT_COMPOSITOR_DRM_TRACE_FILE");
+	if (trace_path && *trace_path) {
+		t->trace = fopen(trace_path, "w");
+		if (!t->trace) {
+			COMP_ERROR(c, "Cannot open DRM trace file: %s", trace_path);
+			free(t);
+			return false;
+		}
+		setvbuf(t->trace, NULL, _IOFBF, 65536);
+		fprintf(t->trace, "event,frame_id,monotonic_ns,value\n");
+		t->base.trace_timing = target_trace;
+	}
 	u_pc_fake_create(c->settings.nominal_frame_interval_ns, os_monotonic_get_ns(), &t->upc);
 	*out = &t->base;
 	return true;

@@ -189,6 +189,7 @@ if(XRT_HAVE_VULKAN)
 endif()
 
 if(TARGET tests_drm_dma)
+	add_test(NAME tests_drm_latency_analysis COMMAND ${PYTHON_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tests_drm_latency_analysis.py")
 	target_link_libraries(tests_drm_geometry PRIVATE comp_drm_kms xrt-interfaces)
 	target_link_libraries(tests_drm_dma PRIVATE comp_drm_dma)
 	target_sources(tests_drm_kms_fence PRIVATE drm_kms_fence_fixture.c)

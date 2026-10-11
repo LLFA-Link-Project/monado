@@ -20,6 +20,7 @@ static_assert(offsetof(arpara_rs_decoded, counter) == 40, "Rust/C++ counter ABI 
 static_assert(offsetof(arpara_rs_decoded, ack) == 45, "Rust/C++ ACK ABI mismatch");
 
 DEBUG_GET_ONCE_BOOL_OPTION(arpara_imu, "ARPARA_IMU", true)
+DEBUG_GET_ONCE_BOOL_OPTION(arpara_pose_timing, "ARPARA_POSE_TIMING", false)
 
 struct arpara_hmd
 {
@@ -32,6 +33,7 @@ struct arpara_hmd
 	struct xrt_quat orientation;
 	uint64_t last_host_ns;
 	uint64_t fusion_ns;
+	uint64_t sample_fusion_ns;
 	uint64_t samples;
 	uint64_t first_host_ns;
 	bool orientation_ready;
@@ -103,6 +105,7 @@ handle_report(struct arpara_hmd *h, const uint8_t *p, size_t n)
 	os_mutex_lock(&h->mutex);
 	h->orientation = h->fusion.rot;
 	h->last_host_ns = now;
+	h->sample_fusion_ns = h->fusion_ns;
 	h->orientation_ready = ready;
 	if (h->samples == 0) {
 		h->first_host_ns = now;
@@ -212,16 +215,27 @@ get_pose(struct xrt_device *xdev, enum xrt_input_name name, int64_t at_timestamp
 	/* Latest sample only: no speculative prediction with unverified calibration. */
 	*out = {};
 	os_mutex_lock(&h->mutex);
+	uint64_t sample_ns = h->last_host_ns;
+	uint64_t device_time_ns = h->sample_fusion_ns;
+	int64_t query_ns = os_monotonic_get_ns();
 	out->pose.orientation = h->orientation;
 	/* 3DoF uses a valid fixed origin, without claiming position tracking.
 	 * OpenXR clients need both valid components to locate VIEW in STAGE. */
 	out->relation_flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-	                                                    XRT_SPACE_RELATION_POSITION_VALID_BIT);
+	                                                      XRT_SPACE_RELATION_POSITION_VALID_BIT);
 	if (!h->disconnected && h->orientation_ready && os_monotonic_get_ns() - h->last_host_ns < 100000000) {
 		out->relation_flags =
 		    (enum xrt_space_relation_flags)(out->relation_flags | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT);
 	}
 	os_mutex_unlock(&h->mutex);
+	if (debug_get_bool_option_arpara_pose_timing()) {
+		U_LOG_I(
+		    "arpara pose timing: requested_ns=%lld receipt_ns=%llu query_ns=%lld fusion_ns=%llu "
+		    "orientation=[%.6f,%.6f,%.6f,%.6f]; prediction=none",
+		    (long long)at_timestamp_ns, (unsigned long long)sample_ns, (long long)query_ns,
+		    (unsigned long long)device_time_ns, out->pose.orientation.x, out->pose.orientation.y,
+		    out->pose.orientation.z, out->pose.orientation.w);
+	}
 	return XRT_SUCCESS;
 }
 
@@ -326,9 +340,10 @@ arpara_create(struct os_hid_device *hid)
 	}
 	U_LOG_I("arpara: loaded DISTORT_POLY3 optics, source SHA-256=%s, eye target=%ux%u; mesh generated",
 	        arpara_optics_source_hash(), h->optics.recommended_width, h->optics.recommended_height);
-	U_LOG_W("arpara: optics from supplied unit calibration; RGB shares green where color fields are absent. "
-	        "IPD, IMU-to-eye transform and provisional 2560x1440/60Hz registration geometry remain uncalibrated; "
-	        "DRM physical mode is selected separately.");
+	U_LOG_W(
+	    "arpara: optics from supplied unit calibration; RGB shares green where color fields are absent. "
+	    "IPD, IMU-to-eye transform and provisional 2560x1440/60Hz registration geometry remain uncalibrated; "
+	    "DRM physical mode is selected separately.");
 	if (d->supported.orientation_tracking && os_thread_helper_start(&h->thread, reader, h) != 0) {
 		U_LOG_E("arpara: failed to start HID reader");
 		destroy(d);

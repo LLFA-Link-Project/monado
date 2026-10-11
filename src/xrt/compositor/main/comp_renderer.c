@@ -180,6 +180,14 @@ struct comp_renderer
  */
 
 static void
+renderer_trace(struct comp_renderer *r, const char *event, int64_t frame_id, int64_t value)
+{
+	struct comp_target *ct = r->c->target;
+	if (ct->trace_timing)
+		ct->trace_timing(ct, event, frame_id, os_monotonic_get_ns(), value);
+}
+
+static void
 renderer_wait_queue_idle(struct comp_renderer *r)
 {
 	COMP_TRACE_MARKER();
@@ -351,9 +359,11 @@ calc_pose_data(struct comp_renderer *r,
 	enum xrt_view_type view_type = (view_count == 1) ? XRT_VIEW_TYPE_MONO : XRT_VIEW_TYPE_STEREO;
 
 	const int64_t scanout_time_ns = calc_scanout_compensation_ns(r);
+	renderer_trace(r, "scanout_compensation", r->c->frame.rendering.id, scanout_time_ns);
 
 	int64_t begin_timestamp_ns = r->c->frame.rendering.predicted_display_time_ns;
 	int64_t end_timestamp_ns = begin_timestamp_ns + scanout_time_ns;
+	renderer_trace(r, "pose_request", r->c->frame.rendering.id, begin_timestamp_ns);
 
 	// Pose at beginning of scanout
 	xrt_result_t xret = xrt_device_get_view_poses( //
@@ -365,6 +375,7 @@ calc_pose_data(struct comp_renderer *r,
 	    &head_relation[0],                         // out_head_relation
 	    xdev_fovs,                                 // out_fovs
 	    xdev_poses[0]);                            //
+	renderer_trace(r, "pose_return", r->c->frame.rendering.id, begin_timestamp_ns);
 	if (xret != XRT_SUCCESS) {
 		struct u_pp_sink_stack_only sink;
 		u_pp_delegate_t dg = u_pp_sink_stack_only_init(&sink);
@@ -1148,6 +1159,8 @@ comp_renderer_draw(struct comp_renderer *r)
 
 	bool fast_path = c->base.frame_params.one_projection_layer_fast_path;
 	bool do_timewarp = !c->debug.atw_off;
+	renderer_trace(r, "timewarp_active", c->frame.rendering.id, do_timewarp);
+	renderer_trace(r, "fast_path", c->frame.rendering.id, fast_path);
 
 	// Consistency check.
 	assert(!fast_path || c->base.layer_accum.layer_count >= 1);
@@ -1155,8 +1168,10 @@ comp_renderer_draw(struct comp_renderer *r)
 	/* Queued non-WSI presentation may return before rendering finishes.
 	 * Shared render resources (descriptor pools, mapped UBOs, command buffer)
 	 * must be retired before preparing the next frame, not merely at submit. */
+	renderer_trace(r, "resource_wait_begin", c->frame.rendering.id, 0);
 	if (ct->defer_present_wait)
 		renderer_wait_for_last_fence(r);
+	renderer_trace(r, "resource_wait_end", c->frame.rendering.id, 0);
 
 	// For scratch image debugging.
 	struct chl_frame_state frame_state;
@@ -1261,7 +1276,9 @@ comp_renderer_draw(struct comp_renderer *r)
 	 *
 	 * This is done after a swap so isn't time critical.
 	 */
+	renderer_trace(r, "queue_idle_begin", frame_id, 0);
 	renderer_wait_queue_idle(r);
+	renderer_trace(r, "queue_idle_end", frame_id, 0);
 
 	/*
 	 * Free any resources and finalize the scratch images,
@@ -1271,6 +1288,12 @@ comp_renderer_draw(struct comp_renderer *r)
 
 	// Check timestamps.
 	if (xret == XRT_SUCCESS) {
+		/* Duration is valid without calibrated clocks; absolute GPU-to-KMS
+		 * subtraction requires the calibrated timestamps below. */
+		uint64_t duration_ns;
+		if (ct->trace_timing && c->base.vk.features.timestamp_valid_bits &&
+		    render_resources_get_duration(&c->nr, &duration_ns))
+			renderer_trace(r, "gpu_duration", frame_id, duration_ns);
 		/*
 		 * Get timestamps of GPU work (if available).
 		 */

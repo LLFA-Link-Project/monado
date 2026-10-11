@@ -53,7 +53,15 @@ struct comp_drm_kms
 	bool changed, failed, flip_done;
 	struct comp_drm_timing timing;
 	uint32_t old_blob;
+	comp_drm_kms_observer observer;
+	void *observer_data;
 };
+void
+comp_drm_kms_set_observer(struct comp_drm_kms *k, comp_drm_kms_observer observer, void *data)
+{
+	k->observer = observer;
+	k->observer_data = data;
+}
 static bool
 error(struct comp_drm_kms *k, const char *op)
 {
@@ -463,6 +471,10 @@ comp_drm_kms_prepare(struct comp_drm_kms *k, const char *connector, const char *
 	        "CPU-copy diagnostic\n",
 	        k->connector, k->crtc, k->plane, k->mode.hdisplay, k->mode.vdisplay, refresh(&k->mode),
 	        k->buffers[0].pitch);
+	fprintf(k->log, "KMS pixel clock=%u kHz, totals=%ux%u; CRTC OUT_FENCE_PTR=%s\n", k->mode.clock, k->mode.htotal,
+	        k->mode.vtotal,
+	        property(k, k->crtc, DRM_MODE_OBJECT_CRTC, "OUT_FENCE_PTR", NULL) ? "supported (unused)"
+	                                                                          : "unavailable");
 	return true;
 }
 static void
@@ -477,6 +489,9 @@ flip(int fd, unsigned sequence, unsigned sec, unsigned usec, void *data)
 	struct timespec receipt;
 	clock_gettime(CLOCK_MONOTONIC, &receipt);
 	k->last_flip_ns = k->timestamp_monotonic ? timestamp : (uint64_t)receipt.tv_sec * 1000000000 + receipt.tv_nsec;
+	if (k->observer)
+		k->observer(k->observer_data, k->timestamp_monotonic ? "flip" : "flip_receipt", k->slots.scanout,
+		            k->last_flip_ns, sequence);
 	struct comp_drm_timing *t = &k->timing;
 	if (!comp_drm_timing_add(t, timestamp, sequence))
 		return;
@@ -522,6 +537,8 @@ queue_fb(struct comp_drm_kms *k, uint32_t fb, int index, int sync_fd)
 		return false;
 	}
 	k->flip_done = false;
+	struct timespec request_time;
+	clock_gettime(CLOCK_MONOTONIC, &request_time);
 	int ret = drmModeAtomicCommit(
 	    k->fd, a, DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT, k);
 	drmModeAtomicFree(a);
@@ -534,6 +551,11 @@ queue_fb(struct comp_drm_kms *k, uint32_t fb, int index, int sync_fd)
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	k->pending_since_ns = (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
+	if (k->observer) {
+		k->observer(k->observer_data, "commit_begin", index,
+		            (uint64_t)request_time.tv_sec * 1000000000 + request_time.tv_nsec, 1);
+		k->observer(k->observer_data, "commit_end", index, k->pending_since_ns, 1);
+	}
 	return true;
 }
 bool

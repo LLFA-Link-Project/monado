@@ -131,6 +131,9 @@ struct comp_target_semaphores
  */
 struct comp_target
 {
+	/* Optional monotonic timing observation. Never waits or changes scheduling. */
+	void (*trace_timing)(
+	    struct comp_target *ct, const char *event, int64_t frame_id, int64_t when_ns, int64_t value);
 	//! Owning compositor.
 	struct comp_compositor *c;
 

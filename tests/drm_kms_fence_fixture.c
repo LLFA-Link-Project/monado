@@ -13,6 +13,27 @@
 
 static unsigned scenario, commits, imports, input_properties;
 static int passed_fd;
+static unsigned observations;
+static uint64_t commit_begin_ns;
+static void
+observe(void *data, const char *event, int index, uint64_t ns, uint64_t value)
+{
+	struct comp_drm_kms *k = data;
+	assert(index == 0);
+	if (!strcmp(event, "commit_begin")) {
+		assert(observations == 0);
+		commit_begin_ns = ns;
+	} else if (!strcmp(event, "commit_end")) {
+		assert(observations == 1 && ns >= commit_begin_ns);
+	} else {
+		assert(observations == 2 && value == 100);
+		assert(k->slots.scanout == 0 && k->slots.queued == -1);
+		assert(!strcmp(event, k->timestamp_monotonic ? "flip" : "flip_receipt"));
+		if (k->timestamp_monotonic)
+			assert(ns == 1000002000);
+	}
+	observations++;
+}
 
 int
 fixture_add_property(drmModeAtomicReqPtr req, uint32_t object, uint32_t prop, uint64_t value)
@@ -73,12 +94,15 @@ drm_kms_fence_fixture(unsigned selected)
 {
 	scenario = selected;
 	commits = imports = input_properties = 0;
+	observations = 0;
 	struct comp_drm_kms k = {
 	    .fd = -1, .log = stderr, .plane = 39, .flip_done = true, .slots = {-1, -1}, .count = 1};
 	k.props[0] = (struct saved_prop){84, 22, 0};
 	k.imported[0].fb = 96;
 	k.imported[0].dma_fd = 123;
 	k.in_fence = 77;
+	k.timestamp_monotonic = scenario != 1;
+	comp_drm_kms_set_observer(&k, observe, &k);
 	if (scenario == 1 || scenario == 3 || scenario == 5) {
 		k.in_fence = 0;
 		k.imported[0].implicit_sync = scenario != 5;
@@ -110,6 +134,11 @@ drm_kms_fence_fixture(unsigned selected)
 		assert(!k.flip_done);
 		assert(k.slots.queued == 0);
 		assert(!comp_drm_kms_slot_free(&k, 0)); // Queued frame cannot be rendered.
+		assert(observations == 2);
+		flip(-1, 100, 1, 2, &k);
+		assert(observations == 3);
+	} else {
+		assert(observations == 0);
 	}
 	return 0;
 }
