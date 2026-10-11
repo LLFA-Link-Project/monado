@@ -499,6 +499,44 @@ EXACT/INTERPOLATED/PREDICTED、ゼロ角速度、位置追跡を偽装しないf
 検証ログは `build/arpara-validation/pose-prediction-{build,tests}.log`。
 KMS、DMA-BUF、sync FD、3画像、6ms wake、光学補正、HID protocolは変更しない。
 
+### 実機ログ22: relation history予測10ms上限
+
+service起動ログで `3f0b6394c`、予測上限10ms、late wake 6ms、GRAPHICS、
+最終3840×1920、sync FD→IN_FENCE_FDを確認。正常終了/KMS state復元あり。
+fast_path=1の3731フレームを21と同じ基準で解析した。
+
+| 指標 | 21: 予測なし | 22: 予測10ms上限 |
+|---|---:|---:|
+| 更新fps | 89.987 | 89.906 |
+| pose取得→flip p50/p95/p99 ms | 5.781/5.878/5.936 | 5.775/5.875/5.929 |
+| GPU query duration p50/p95/p99 ms | 2.223/2.921/3.135 | 2.207/2.660/3.009 |
+| flip間隔 p50/p95/p99/max ms | 11.111/11.114/11.116/22.222 | 11.111/11.114/11.121/22.221 |
+| 更新のないVBlank数 | 1 | 4 |
+| desired超過 >0.5ms | 2 | 5 |
+| submit済み未表示最大 / 未flip要求 | 1/0 | 1/0 |
+
+通常描画の表示待ち時間やGPU時間に大きな悪化はなく、約90Hzを維持している。
+ただし未更新VBlankは4回（interval 3730回に対して約0.11%）あり、完全な無欠落ではない。
+sequence gapはframe7/8/540/2733の前。開始直後2回、通常動作中にも2回ある。
+desired超過5回のうち最初の3回は通常描画開始3フレームでGPU duration約5.7〜6.4ms。
+後の2回はGPU duration約2.2〜2.4msであり、GPU shader負荷だけが原因とは断定しない。
+短い別run間のfps差約0.08を予測処理の回帰/有意な差として断定する情報はない。
+同期/commitエラーはなく、CPU pixel copy/release fence wait=0のログを確認した。
+
+ユーザー実機評価: 「かなり良くなっている」「10ms上限で行き過ぎや揺れはあまり感じない」。
+未来時刻に対応したposeの利用で回転追従が改善したという解釈と整合するが、
+CSVのpose取得→flipが短縮したためとは扱わない（この区間は約5.8msのまま）。
+今回ARPARA_POSE_TIMINGの記録はなく、個々のapplied prediction時間/上限到達率、
+IMUサンプルの受信時刻からの古さは未測定。常に10ms先を予測したとは主張しない。
+絶対MTP/発光時刻との一致、WiVRnでの予測有効時の回帰も未検証。
+
+現時点の実機で好結果の比較基準は90.001Hz、Graphics、scale100%、
+PRE_FRAME_WAIT=1、WAKE_BUDGET_US=6000、ARPARA_POSE_PREDICTION_MS=10。
+予測上限やwake余裕を同時に詰めず、この設定を保持して長めの動作と回転停止/反転を確認する。
+さらに改善を測る際は、短い別runのpose timingで実際の外挿時間とsample ageを確認し、
+未実測のdisplay offsetとIMU capture/host clock対応の検証を優先する。
+このログ解析ではソース・既定設定・同期処理を変更していない。
+
 既存buildの全体ビルドとCTestを実行する。KMS fault injectionではcommitの成功/失敗、
 sync FD所有権、queued/scanout再利用防止に加え、observerのimage対応/monotonic判定を確認する。
 pacerテストは上書きした予測が1回だけ適用されることを確認する。
